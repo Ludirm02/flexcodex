@@ -2,7 +2,6 @@
 #define FLEXQL_SQL_ENGINE_HPP
 
 #include <cstdint>
-#include <array>
 #include <list>
 #include <mutex>
 #include <shared_mutex>
@@ -41,8 +40,6 @@ private:
 
     struct Row {
         std::vector<std::string> values;
-        std::array<long double, 64> numeric_cache{};
-        std::array<std::uint8_t, 64> numeric_valid{};
         std::int64_t expires_at_unix = 0;
     };
 
@@ -59,6 +56,8 @@ private:
         std::unordered_map<std::string, std::size_t> primary_index;
         std::vector<std::vector<NumericIndexEntry>> numeric_range_index;
         std::vector<std::uint8_t> numeric_range_sorted;
+        std::vector<std::vector<long double>> numeric_column_values;
+        std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
         std::uint64_t version = 1;
     };
@@ -86,6 +85,7 @@ private:
     struct CacheEntry {
         QueryResult result;
         std::unordered_map<std::string, std::uint64_t> versions;
+        std::size_t approx_bytes = 0;
     };
 
     class QueryCache {
@@ -105,6 +105,8 @@ private:
                            std::list<std::pair<std::string, CacheEntry>>::iterator>
             map_;
         std::mutex mutex_;
+        std::size_t max_bytes_ = 0;
+        std::size_t current_bytes_ = 0;
     };
 
     bool execute_create_table(const std::string& sql, std::string& error);
@@ -147,6 +149,9 @@ private:
     static std::int64_t now_unix();
     static bool parse_datetime_to_unix(const std::string& s, std::int64_t& out);
     static bool parse_numeric_literal(const std::string& s, DataType type, long double& out);
+    static bool fast_parse_int64(const std::string& s, std::int64_t& out);
+    static bool fast_parse_long_double(const std::string& s, long double& out);
+    static bool is_null_literal_ci(const std::string& s);
     static bool eval_numeric_op(long double lhs, long double rhs, const std::string& op, bool& out);
     static bool compare_values(const std::string& lhs,
                                const std::string& rhs,
@@ -163,6 +168,10 @@ private:
                                     const std::string& kw,
                                     std::size_t start = 0);
     static bool row_alive(const Row& row, std::int64_t now_ts);
+    static bool row_numeric_value(const Table& table,
+                                  const Row& row,
+                                  std::size_t col_idx,
+                                  long double& out);
 
     bool validate_typed_value(const Column& col,
                               std::string& value,

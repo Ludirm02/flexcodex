@@ -22,7 +22,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-sleep 0.5
+sleep 1
 
 "$ROOT_DIR/build/flexql_benchmark" 127.0.0.1 "$PORT" "$ROWS" | tee "$OUT_FILE"
 

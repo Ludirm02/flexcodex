@@ -1,6 +1,6 @@
 # FlexQL Design Document
 
-Repository Link: `REPLACE_WITH_YOUR_ACTUAL_GITHUB_REPOSITORY_URL`
+Repository Link: `SET_THIS_TO_YOUR_ACTUAL_GITHUB_REPOSITORY_URL_BEFORE_SUBMISSION`
 
 ## 1. System Overview
 
@@ -30,8 +30,8 @@ Each table stores:
 - **Row-major storage** is used.
 - Each row is stored as:
   - `vector<string> values`
-  - `vector<long double> numeric_cache` for pre-parsed numeric fast paths
-  - `vector<uint8_t> numeric_valid` bitmap for numeric cache validity
+  - `array<long double, 64> numeric_cache` for pre-parsed numeric fast paths
+  - `array<uint8_t, 64> numeric_valid` bitmap for numeric cache validity
   - `int64_t expires_at_unix`
 
 This layout keeps insert and join projection logic simple while still enabling indexing and selective scans.
@@ -155,6 +155,8 @@ Protocol is length-prefixed request + line-based response:
 - Error: `ERR\t<message>`
 
 TCP `TCP_NODELAY` is enabled to reduce latency for many small SQL requests.
+Client query send path transmits header/body without building a large combined packet copy.
+Protocol row parsing and serialization paths are buffered and low-allocation for high-row-count scans.
 
 ## 9. Performance Evaluation Setup
 

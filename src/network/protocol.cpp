@@ -226,9 +226,14 @@ std::vector<std::string> split_tab_escaped(const std::string& line, std::size_t 
 }
 
 bool send_query(int fd, const std::string& sql) {
-    std::string packet = "Q " + std::to_string(sql.size()) + "\n";
-    packet += sql;
-    return send_all(fd, packet.data(), packet.size());
+    const std::string header = "Q " + std::to_string(sql.size()) + "\n";
+    if (!send_all(fd, header.data(), header.size())) {
+        return false;
+    }
+    if (sql.empty()) {
+        return true;
+    }
+    return send_all(fd, sql.data(), sql.size());
 }
 
 }  // namespace flexql_proto

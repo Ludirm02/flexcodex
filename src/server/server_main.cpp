@@ -11,7 +11,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <condition_variable>
+#include <functional>
 #include <iostream>
+#include <mutex>
+#include <queue>
 #include <string>
 #include <thread>
 #include <vector>
@@ -157,6 +161,66 @@ void handle_client(int client_fd, SqlEngine* engine) {
     ::close(client_fd);
 }
 
+class ThreadPool {
+public:
+    explicit ThreadPool(std::size_t threads) {
+        if (threads == 0) {
+            threads = 4;
+        }
+        workers_.reserve(threads);
+        for (std::size_t i = 0; i < threads; ++i) {
+            workers_.emplace_back([this]() {
+                for (;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(mutex_);
+                        cv_.wait(lock, [this]() {
+                            return stopping_ || !tasks_.empty();
+                        });
+                        if (stopping_ && tasks_.empty()) {
+                            return;
+                        }
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    task();
+                }
+            });
+        }
+    }
+
+    ~ThreadPool() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        cv_.notify_all();
+        for (std::thread& worker : workers_) {
+            if (worker.joinable()) {
+                worker.join();
+            }
+        }
+    }
+
+    void submit(std::function<void()> task) {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            if (stopping_) {
+                return;
+            }
+            tasks_.push(std::move(task));
+        }
+        cv_.notify_one();
+    }
+
+private:
+    std::vector<std::thread> workers_;
+    std::queue<std::function<void()>> tasks_;
+    std::mutex mutex_;
+    std::condition_variable cv_;
+    bool stopping_ = false;
+};
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -202,6 +266,7 @@ int main(int argc, char** argv) {
     }
 
     SqlEngine engine(512);
+    ThreadPool pool(std::thread::hardware_concurrency());
     std::cout << "FlexQL server listening on port " << port << "\n";
 
     for (;;) {
@@ -219,8 +284,9 @@ int main(int argc, char** argv) {
         int one_tcp = 1;
         (void)::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one_tcp, sizeof(one_tcp));
 
-        std::thread t(handle_client, client_fd, &engine);
-        t.detach();
+        pool.submit([client_fd, &engine]() {
+            handle_client(client_fd, &engine);
+        });
     }
 
     ::close(server_fd);
