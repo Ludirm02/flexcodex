@@ -45,7 +45,7 @@ private:
 
     struct Table {
         struct NumericIndexEntry {
-            long double value = 0.0L;
+            double value = 0.0;
             std::size_t row_idx = 0;
         };
 
@@ -56,7 +56,7 @@ private:
         std::unordered_map<std::string, std::size_t> primary_index;
         std::vector<std::vector<NumericIndexEntry>> numeric_range_index;
         std::vector<std::uint8_t> numeric_range_sorted;
-        std::vector<std::vector<long double>> numeric_column_values;
+        std::vector<std::vector<double>> numeric_column_values;
         std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
         std::uint64_t version = 1;
@@ -148,11 +148,11 @@ private:
     static std::string unquote_literal(const std::string& s);
     static std::int64_t now_unix();
     static bool parse_datetime_to_unix(const std::string& s, std::int64_t& out);
-    static bool parse_numeric_literal(const std::string& s, DataType type, long double& out);
+    static bool parse_numeric_literal(const std::string& s, DataType type, double& out);
     static bool fast_parse_int64(const std::string& s, std::int64_t& out);
-    static bool fast_parse_long_double(const std::string& s, long double& out);
+    static bool fast_parse_double(const std::string& s, double& out);
     static bool is_null_literal_ci(const std::string& s);
-    static bool eval_numeric_op(long double lhs, long double rhs, const std::string& op, bool& out);
+    static bool eval_numeric_op(double lhs, double rhs, const std::string& op, bool& out);
     static bool compare_values(const std::string& lhs,
                                const std::string& rhs,
                                DataType type,
@@ -168,15 +168,16 @@ private:
                                     const std::string& kw,
                                     std::size_t start = 0);
     static bool row_alive(const Row& row, std::int64_t now_ts);
+    static bool row_index_of(const Table& table, const Row& row, std::size_t& row_idx);
     static bool row_numeric_value(const Table& table,
                                   const Row& row,
                                   std::size_t col_idx,
-                                  long double& out);
+                                  double& out);
 
     bool validate_typed_value(const Column& col,
                               std::string& value,
                               std::string& error,
-                              long double* numeric_out = nullptr,
+                              double* numeric_out = nullptr,
                               bool* numeric_valid = nullptr) const;
     const Column* lookup_column(const Table& table,
                                 const std::string& col_ref,

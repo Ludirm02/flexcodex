@@ -254,7 +254,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         }
     }
 
-    std::vector<long double> parsed_numeric(table.columns.size(), 0.0L);
+    std::vector<double> parsed_numeric(table.columns.size(), 0.0);
     std::vector<std::uint8_t> parsed_numeric_valid(table.columns.size(), 0U);
 
     const std::int64_t now_ts = now_unix();
@@ -262,6 +262,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         Row row;
         row.values = std::move(rows_values[r]);
         row.expires_at_unix = expires_at[r];
+        std::string pk_key;
 
         if (row.values.size() != table.columns.size()) {
             error = "column count mismatch in INSERT";
@@ -270,7 +271,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
 
         std::fill(parsed_numeric_valid.begin(), parsed_numeric_valid.end(), 0U);
         for (std::size_t i = 0; i < row.values.size(); ++i) {
-            long double parsed = 0.0L;
+            double parsed = 0.0;
             bool numeric_valid = false;
             if (!validate_typed_value(table.columns[i], row.values[i], error, &parsed, &numeric_valid)) {
                 return false;
@@ -282,12 +283,12 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         }
 
         if (table.primary_key_col >= 0) {
-            const std::string& key = row.values[static_cast<std::size_t>(table.primary_key_col)];
-            auto idx_it = table.primary_index.find(key);
+            pk_key = row.values[static_cast<std::size_t>(table.primary_key_col)];
+            auto idx_it = table.primary_index.find(pk_key);
             if (idx_it != table.primary_index.end()) {
                 std::size_t row_idx = idx_it->second;
                 if (row_idx < table.rows.size() && row_alive(table.rows[row_idx], now_ts)) {
-                    error = "duplicate primary key value: " + key;
+                    error = "duplicate primary key value: " + pk_key;
                     return false;
                 }
             }
@@ -297,8 +298,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         const std::size_t row_idx = table.rows.size() - 1;
 
         if (table.primary_key_col >= 0) {
-            const std::string& key = table.rows.back().values[static_cast<std::size_t>(table.primary_key_col)];
-            table.primary_index[key] = row_idx;
+            table.primary_index[pk_key] = row_idx;
         }
 
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
@@ -380,7 +380,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             std::string op;
             std::string rhs_unquoted;
             bool rhs_numeric_valid = false;
-            long double rhs_numeric = 0.0L;
+            double rhs_numeric = 0.0;
         } where_meta;
 
         if (plan.where.present) {
@@ -422,7 +422,8 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             out.rows.reserve(std::max<std::size_t>(1024, base.rows.size() / 2));
         }
 
-        auto emit_projected_row = [&](const Row& row) {
+        auto emit_projected_row = [&](std::size_t row_idx) {
+            const Row& row = base.rows[row_idx];
             std::vector<std::string> projected;
             projected.reserve(selected_indexes.size());
             for (std::size_t idx : selected_indexes) {
@@ -431,7 +432,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             out.rows.push_back(std::move(projected));
         };
 
-        auto fast_numeric_value = [&](std::size_t row_idx, std::size_t col_idx, long double& out_num) -> bool {
+        auto fast_numeric_value = [&](std::size_t row_idx, std::size_t col_idx, double& out_num) -> bool {
             if (col_idx >= base.numeric_column_valid.size() || col_idx >= base.numeric_column_values.size()) {
                 return false;
             }
@@ -444,13 +445,13 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             return true;
         };
 
-        auto passes_where = [&](const Row& row, std::size_t row_idx, bool& pass) -> bool {
+        auto passes_where = [&](std::size_t row_idx, bool& pass) -> bool {
             if (!where_meta.enabled) {
                 pass = true;
                 return true;
             }
 
-            long double lhs_numeric = 0.0L;
+            double lhs_numeric = 0.0;
             if (where_meta.rhs_numeric_valid &&
                 fast_numeric_value(row_idx, where_meta.idx, lhs_numeric) &&
                 (where_meta.type == DataType::kInt || where_meta.type == DataType::kDecimal ||
@@ -463,7 +464,10 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
 
             std::string cmp_error;
-            if (!compare_values(row.values[where_meta.idx], where_meta.rhs_unquoted, where_meta.type, where_meta.op,
+            if (!compare_values(base.rows[row_idx].values[where_meta.idx],
+                                where_meta.rhs_unquoted,
+                                where_meta.type,
+                                where_meta.op,
                                 pass, cmp_error)) {
                 error = cmp_error;
                 return false;
@@ -491,13 +495,13 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
 
             bool pass = false;
-            if (!passes_where(row, row_idx, pass)) {
+            if (!passes_where(row_idx, pass)) {
                 return true;
             }
             if (!pass) {
                 return true;
             }
-            emit_projected_row(row);
+            emit_projected_row(row_idx);
             return true;
         };
 
@@ -535,10 +539,10 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             const auto& idx_vec = mutable_base.numeric_range_index[where_meta.idx];
             auto lower = std::lower_bound(
                 idx_vec.begin(), idx_vec.end(), where_meta.rhs_numeric,
-                [](const Table::NumericIndexEntry& a, long double rhs) { return a.value < rhs; });
+                [](const Table::NumericIndexEntry& a, double rhs) { return a.value < rhs; });
             auto upper = std::upper_bound(
                 idx_vec.begin(), idx_vec.end(), where_meta.rhs_numeric,
-                [](long double rhs, const Table::NumericIndexEntry& a) { return rhs < a.value; });
+                [](double rhs, const Table::NumericIndexEntry& a) { return rhs < a.value; });
 
             std::size_t candidate_count = 0;
             if (where_meta.op == "=") {
@@ -566,13 +570,13 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
                         continue;
                     }
                     bool pass = false;
-                    if (!passes_where(row, it->row_idx, pass)) {
+                    if (!passes_where(it->row_idx, pass)) {
                         return false;
                     }
                     if (!pass) {
                         continue;
                     }
-                    emit_projected_row(row);
+                    emit_projected_row(it->row_idx);
                 }
                 return true;
             };
@@ -607,13 +611,13 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
                         continue;
                     }
                     bool pass = false;
-                    if (!passes_where(row, row_idx, pass)) {
+                    if (!passes_where(row_idx, pass)) {
                         return false;
                     }
                     if (!pass) {
                         continue;
                     }
-                    emit_projected_row(row);
+                    emit_projected_row(row_idx);
                 }
             }
         }
@@ -765,11 +769,15 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         join_cmp_type = DataType::kVarchar;
     }
 
-    auto make_join_key = [&](const Table& table, const Row& row, std::size_t idx, std::string& key_out) -> bool {
-        long double numeric_value = 0.0L;
+    auto make_join_key = [&](const Table& table, std::size_t row_idx, std::size_t idx, std::string& key_out) -> bool {
+        double numeric_value = 0.0;
         if ((join_cmp_type == DataType::kInt || join_cmp_type == DataType::kDecimal ||
-             join_cmp_type == DataType::kDatetime) &&
-            row_numeric_value(table, row, idx, numeric_value)) {
+             join_cmp_type == DataType::kDatetime) && idx < table.numeric_column_valid.size() &&
+            idx < table.numeric_column_values.size() &&
+            row_idx < table.numeric_column_valid[idx].size() &&
+            row_idx < table.numeric_column_values[idx].size() &&
+            table.numeric_column_valid[idx][row_idx] != 0U) {
+            numeric_value = table.numeric_column_values[idx][row_idx];
             if (join_cmp_type == DataType::kInt) {
                 long long n = static_cast<long long>(numeric_value);
                 key_out = "I:" + std::to_string(n);
@@ -777,7 +785,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
             if (join_cmp_type == DataType::kDecimal) {
                 std::ostringstream oss;
-                oss << std::setprecision(std::numeric_limits<long double>::max_digits10) << numeric_value;
+                oss << std::setprecision(std::numeric_limits<double>::max_digits10) << numeric_value;
                 key_out = "D:" + oss.str();
                 return true;
             }
@@ -786,7 +794,10 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             return true;
         }
 
-        const std::string& raw = row.values[idx];
+        if (row_idx >= table.rows.size() || idx >= table.rows[row_idx].values.size()) {
+            return false;
+        }
+        const std::string& raw = table.rows[row_idx].values[idx];
         const std::string v = trim(raw);
         if (is_null_literal_ci(v)) {
             key_out = "N:";
@@ -803,13 +814,13 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             return true;
         }
         if (join_cmp_type == DataType::kDecimal) {
-            long double d = 0.0L;
-            if (!fast_parse_long_double(v, d)) {
+            double d = 0.0;
+            if (!fast_parse_double(v, d)) {
                 key_out = "X:" + v;
                 return true;
             }
             std::ostringstream oss;
-            oss << std::setprecision(std::numeric_limits<long double>::max_digits10) << d;
+            oss << std::setprecision(std::numeric_limits<double>::max_digits10) << d;
             key_out = "D:" + oss.str();
             return true;
         }
@@ -840,28 +851,30 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         hash_is_base = false;
     }
 
-    std::unordered_map<std::string, std::vector<const Row*>> join_hash;
+    std::unordered_map<std::string, std::vector<std::size_t>> join_hash;
     join_hash.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
 
-    for (const Row& row : hash_table->rows) {
+    for (std::size_t hash_row_idx = 0; hash_row_idx < hash_table->rows.size(); ++hash_row_idx) {
+        const Row& row = hash_table->rows[hash_row_idx];
         if (!row_alive(row, now_ts)) {
             continue;
         }
         std::string key;
-        if (!make_join_key(*hash_table, row, hash_idx, key)) {
+        if (!make_join_key(*hash_table, hash_row_idx, hash_idx, key)) {
             error = "failed to compute join key";
             return false;
         }
-        join_hash[key].push_back(&row);
+        join_hash[key].push_back(hash_row_idx);
     }
 
-    for (const Row& probe_row : probe_table->rows) {
+    for (std::size_t probe_row_idx = 0; probe_row_idx < probe_table->rows.size(); ++probe_row_idx) {
+        const Row& probe_row = probe_table->rows[probe_row_idx];
         if (!row_alive(probe_row, now_ts)) {
             continue;
         }
 
         std::string key;
-        if (!make_join_key(*probe_table, probe_row, probe_idx, key)) {
+        if (!make_join_key(*probe_table, probe_row_idx, probe_idx, key)) {
             error = "failed to compute join key";
             return false;
         }
@@ -871,9 +884,11 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             continue;
         }
 
-        for (const Row* matched_row : hit->second) {
-            const Row* base_row_ptr = hash_is_base ? matched_row : &probe_row;
-            const Row* right_row_ptr = hash_is_base ? &probe_row : matched_row;
+        for (std::size_t matched_row_idx : hit->second) {
+            const std::size_t base_row_idx = hash_is_base ? matched_row_idx : probe_row_idx;
+            const std::size_t right_row_idx = hash_is_base ? probe_row_idx : matched_row_idx;
+            const Row* base_row_ptr = &base.rows[base_row_idx];
+            const Row* right_row_ptr = &right.rows[right_row_idx];
 
             std::string where_error;
             bool pass = evaluate_where_join(base, *base_row_ptr, right, *right_row_ptr, plan.where, &where_error);
@@ -889,9 +904,9 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             projected.reserve(projections.size());
             for (const Projection& p : projections) {
                 if (p.table == &base) {
-                    projected.push_back(base_row_ptr->values[p.index]);
+                    projected.push_back(base.rows[base_row_idx].values[p.index]);
                 } else {
-                    projected.push_back(right_row_ptr->values[p.index]);
+                    projected.push_back(right.rows[right_row_idx].values[p.index]);
                 }
             }
             out.rows.push_back(std::move(projected));
@@ -1447,8 +1462,8 @@ bool SqlEngine::evaluate_where(const Table& table,
 
     bool result = false;
     const std::string rhs = unquote_literal(condition.value);
-    long double rhs_num = 0.0L;
-    long double lhs_num = 0.0L;
+    double rhs_num = 0.0;
+    double lhs_num = 0.0;
     if ((col->type == DataType::kInt || col->type == DataType::kDecimal || col->type == DataType::kDatetime) &&
         row_numeric_value(table, row, idx, lhs_num) &&
         parse_numeric_literal(rhs, col->type, rhs_num)) {
@@ -1539,8 +1554,8 @@ bool SqlEngine::evaluate_where_join(const Table& left,
 
     bool result = false;
     const std::string rhs = unquote_literal(condition.value);
-    long double rhs_num = 0.0L;
-    long double lhs_num = 0.0L;
+    double rhs_num = 0.0;
+    double lhs_num = 0.0;
     if ((col->type == DataType::kInt || col->type == DataType::kDecimal || col->type == DataType::kDatetime) &&
         row_numeric_value(*table, *row, idx, lhs_num) &&
         parse_numeric_literal(rhs, col->type, rhs_num)) {
@@ -1771,13 +1786,21 @@ bool SqlEngine::fast_parse_int64(const std::string& s, std::int64_t& out) {
     return parsed.ec == std::errc{} && parsed.ptr == end;
 }
 
-bool SqlEngine::fast_parse_long_double(const std::string& s, long double& out) {
+bool SqlEngine::fast_parse_double(const std::string& s, double& out) {
     if (s.empty()) {
         return false;
     }
+
+    const char* begin = s.data();
+    const char* endp = s.data() + s.size();
+    auto parsed_fast = std::from_chars(begin, endp, out, std::chars_format::general);
+    if (parsed_fast.ec == std::errc{} && parsed_fast.ptr == endp) {
+        return true;
+    }
+
     char* end = nullptr;
     errno = 0;
-    long double parsed = std::strtold(s.c_str(), &end);
+    double parsed = std::strtod(s.c_str(), &end);
     if (errno == ERANGE || end == s.c_str() || *end != '\0') {
         return false;
     }
@@ -1796,7 +1819,7 @@ bool SqlEngine::is_null_literal_ci(const std::string& s) {
            std::toupper(static_cast<unsigned char>(v[3])) == 'L';
 }
 
-bool SqlEngine::parse_numeric_literal(const std::string& s, DataType type, long double& out) {
+bool SqlEngine::parse_numeric_literal(const std::string& s, DataType type, double& out) {
     const std::string v = trim(s);
     if (is_null_literal_ci(v)) {
         return false;
@@ -1807,24 +1830,24 @@ bool SqlEngine::parse_numeric_literal(const std::string& s, DataType type, long 
         if (!fast_parse_int64(v, n)) {
             return false;
         }
-        out = static_cast<long double>(n);
+        out = static_cast<double>(n);
         return true;
     }
     if (type == DataType::kDecimal) {
-        return fast_parse_long_double(v, out);
+        return fast_parse_double(v, out);
     }
     if (type == DataType::kDatetime) {
         std::int64_t ts = 0;
         if (!parse_datetime_to_unix(v, ts)) {
             return false;
         }
-        out = static_cast<long double>(ts);
+        out = static_cast<double>(ts);
         return true;
     }
     return false;
 }
 
-bool SqlEngine::eval_numeric_op(long double lhs, long double rhs, const std::string& op, bool& out) {
+bool SqlEngine::eval_numeric_op(double lhs, double rhs, const std::string& op, bool& out) {
     if (op == "=") {
         out = (lhs == rhs);
         return true;
@@ -1904,9 +1927,9 @@ bool SqlEngine::compare_values(const std::string& lhs,
     }
 
     if (type == DataType::kDecimal) {
-        long double a = 0.0L;
-        long double b = 0.0L;
-        if (!fast_parse_long_double(lhs, a) || !fast_parse_long_double(rhs, b)) {
+        double a = 0.0;
+        double b = 0.0;
+        if (!fast_parse_double(lhs, a) || !fast_parse_double(rhs, b)) {
             error = "invalid decimal comparison value";
             return false;
         }
@@ -2077,25 +2100,32 @@ bool SqlEngine::row_alive(const Row& row, std::int64_t now_ts) {
     return row.expires_at_unix == 0 || row.expires_at_unix > now_ts;
 }
 
-bool SqlEngine::row_numeric_value(const Table& table,
-                                  const Row& row,
-                                  std::size_t col_idx,
-                                  long double& out) {
-    if (col_idx >= table.numeric_column_valid.size() || col_idx >= table.numeric_column_values.size()) {
-        return false;
-    }
+bool SqlEngine::row_index_of(const Table& table, const Row& row, std::size_t& row_idx) {
     if (table.rows.empty()) {
         return false;
     }
-
     const Row* begin = table.rows.data();
     const Row* end = begin + table.rows.size();
     const Row* ptr = &row;
     if (ptr < begin || ptr >= end) {
         return false;
     }
+    row_idx = static_cast<std::size_t>(ptr - begin);
+    return true;
+}
 
-    const std::size_t row_idx = static_cast<std::size_t>(ptr - begin);
+bool SqlEngine::row_numeric_value(const Table& table,
+                                  const Row& row,
+                                  std::size_t col_idx,
+                                  double& out) {
+    if (col_idx >= table.numeric_column_valid.size() || col_idx >= table.numeric_column_values.size()) {
+        return false;
+    }
+
+    std::size_t row_idx = 0;
+    if (!row_index_of(table, row, row_idx)) {
+        return false;
+    }
     const auto& valid = table.numeric_column_valid[col_idx];
     const auto& values = table.numeric_column_values[col_idx];
     if (row_idx >= valid.size() || row_idx >= values.size() || valid[row_idx] == 0U) {
@@ -2109,7 +2139,7 @@ bool SqlEngine::row_numeric_value(const Table& table,
 bool SqlEngine::validate_typed_value(const Column& col,
                                      std::string& value,
                                      std::string& error,
-                                     long double* numeric_out,
+                                     double* numeric_out,
                                      bool* numeric_valid) const {
     if (numeric_valid != nullptr) {
         *numeric_valid = false;
@@ -2130,7 +2160,7 @@ bool SqlEngine::validate_typed_value(const Column& col,
             return false;
         }
         if (numeric_out != nullptr) {
-            *numeric_out = static_cast<long double>(parsed);
+            *numeric_out = static_cast<double>(parsed);
         }
         if (numeric_valid != nullptr) {
             *numeric_valid = true;
@@ -2139,8 +2169,8 @@ bool SqlEngine::validate_typed_value(const Column& col,
     }
 
     if (col.type == DataType::kDecimal) {
-        long double parsed = 0.0L;
-        if (!fast_parse_long_double(value, parsed)) {
+        double parsed = 0.0;
+        if (!fast_parse_double(value, parsed)) {
             error = "invalid DECIMAL value for column " + col.name;
             return false;
         }
@@ -2160,7 +2190,7 @@ bool SqlEngine::validate_typed_value(const Column& col,
             return false;
         }
         if (numeric_out != nullptr) {
-            *numeric_out = static_cast<long double>(parsed);
+            *numeric_out = static_cast<double>(parsed);
         }
         if (numeric_valid != nullptr) {
             *numeric_valid = true;
