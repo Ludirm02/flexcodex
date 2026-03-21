@@ -179,7 +179,7 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.primary_key_col = primary_col;
     t.rows.reserve(1024);
     t.column_index.reserve(t.columns.size());
-    t.numeric_range_index.resize(t.columns.size());
+   
     t.numeric_column_values.resize(t.columns.size());
     t.numeric_column_valid.resize(t.columns.size());
     if (primary_col >= 0) {
@@ -232,9 +232,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             if (table.primary_key_col >= 0 && i == static_cast<std::size_t>(table.primary_key_col)) {
                 continue;
             }
-            if (table.numeric_range_index[i].capacity() < target) {
-                table.numeric_range_index[i].reserve(target);
-            }
+           
             if (table.numeric_column_values[i].capacity() < target) {
                 table.numeric_column_values[i].reserve(target);
             }
@@ -342,12 +340,6 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
 
             table.numeric_column_values[i].push_back(parsed_numeric[i]);
             table.numeric_column_valid[i].push_back(parsed_numeric_valid[i]);
-
-            if (parsed_numeric_valid[i] == 0U) {
-                continue;
-            }
-            table.numeric_range_index[i].push_back(
-                Table::NumericIndexEntry{parsed_numeric[i], row_idx});
         }
     }
 
@@ -558,51 +550,35 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             if (where_meta.op == "!=") {
                 return false;
             }
-            if (where_meta.idx >= base.numeric_range_index.size()) {
+            if (where_meta.idx >= base.numeric_column_values.size()) {
                 return false;
             }
 
-            const auto& idx_vec = base.numeric_range_index[where_meta.idx];
-            if (idx_vec.empty()) {
+            const auto& col_vals  = base.numeric_column_values[where_meta.idx];
+            const auto& col_valid = base.numeric_column_valid[where_meta.idx];
+            const std::size_t n   = base.rows.size();
+            if (col_vals.empty()) {
                 return true;
             }
 
-            const std::size_t reserve_target = idx_vec.size() / 2;
-            if (reserve_target > out.rows.capacity()) {
-                out.rows.reserve(reserve_target);
-            }
+            out.rows.reserve(std::max<std::size_t>(1024, n / 2));
 
-            auto matches = [&](double lhs) -> bool {
-                if (where_meta.op == "=") {
-                    return lhs == where_meta.rhs_numeric;
-                }
-                if (where_meta.op == "<") {
-                    return lhs < where_meta.rhs_numeric;
-                }
-                if (where_meta.op == "<=") {
-                    return lhs <= where_meta.rhs_numeric;
-                }
-                if (where_meta.op == ">") {
-                    return lhs > where_meta.rhs_numeric;
-                }
-                if (where_meta.op == ">=") {
-                    return lhs >= where_meta.rhs_numeric;
-                }
-                return false;
-            };
+            const double rhs      = where_meta.rhs_numeric;
+            const std::string& op = where_meta.op;
 
-            for (const auto& entry : idx_vec) {
-                if (!matches(entry.value)) {
-                    continue;
-                }
-                if (entry.row_idx >= base.rows.size()) {
-                    continue;
-                }
-                const Row& row = base.rows[entry.row_idx];
-                if (!row_alive(row, now_ts)) {
-                    continue;
-                }
-                emit_projected_row(entry.row_idx);
+            for (std::size_t i = 0; i < n; ++i) {
+                if (col_valid[i] == 0U) continue;
+                if (!row_alive(base.rows[i], now_ts)) continue;
+                const double lhs = col_vals[i];
+                bool pass = false;
+                if      (op == "=" )  pass = (lhs == rhs);
+                else if (op == "!=")  pass = (lhs != rhs);
+                else if (op == ">" )  pass = (lhs >  rhs);
+                else if (op == ">=")  pass = (lhs >= rhs);
+                else if (op == "<" )  pass = (lhs <  rhs);
+                else if (op == "<=")  pass = (lhs <= rhs);
+                if (!pass) continue;
+                emit_projected_row(i);
             }
             return true;
         };

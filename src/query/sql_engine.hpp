@@ -44,18 +44,14 @@ private:
     };
 
     struct Table {
-        struct NumericIndexEntry {
-            double value = 0.0;
-            std::size_t row_idx = 0;
-        };
+        
 
         std::string name;
         std::vector<Column> columns;
         std::unordered_map<std::string, std::size_t> column_index;
         int primary_key_col = -1;
         std::unordered_map<std::string, std::size_t> primary_index;
-        std::vector<std::vector<NumericIndexEntry>> numeric_range_index;
-        std::vector<std::vector<double>> numeric_column_values;
+// numeric_range_index removed; direct column scan used instead        std::vector<std::vector<double>> numeric_column_values;
         std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
         std::uint64_t version = 1;
