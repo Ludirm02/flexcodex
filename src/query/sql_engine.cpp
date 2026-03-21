@@ -415,6 +415,8 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             std::size_t idx = 0;
             DataType type = DataType::kVarchar;
             std::string op;
+            char op0 = '\0';
+            char op1 = '\0';
             std::string rhs_unquoted;
             bool rhs_numeric_valid = false;
             double rhs_numeric = 0.0;
@@ -440,6 +442,8 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             where_meta.enabled = true;
             where_meta.type = col->type;
             where_meta.op = plan.where.op;
+            where_meta.op0 = plan.where.op[0];
+            where_meta.op1 = plan.where.op.size() > 1 ? plan.where.op[1] : '\0';
             where_meta.rhs_unquoted = unquote_literal(plan.where.value);
             where_meta.rhs_numeric_valid = parse_numeric_literal(where_meta.rhs_unquoted, where_meta.type,
                                                                  where_meta.rhs_numeric);
@@ -459,14 +463,15 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             out.rows.reserve(std::max<std::size_t>(1024, base.rows.size() / 2));
         }
 
+        std::vector<std::string> projected_buf;
+        projected_buf.resize(selected_indexes.size());
+        
         auto emit_projected_row = [&](std::size_t row_idx) {
             const Row& row = base.rows[row_idx];
-            std::vector<std::string> projected;
-            projected.reserve(selected_indexes.size());
-            for (std::size_t idx : selected_indexes) {
-                projected.push_back(row.values[idx]);
+            for (std::size_t i = 0; i < selected_indexes.size(); ++i) {
+                projected_buf[i] = row.values[selected_indexes[i]];
             }
-            out.rows.push_back(std::move(projected));
+            out.rows.push_back(projected_buf);
         };
 
         auto fast_numeric_value = [&](std::size_t row_idx, std::size_t col_idx, double& out_num) -> bool {
@@ -1291,7 +1296,7 @@ bool SqlEngine::parse_insert(const std::string& sql,
 bool SqlEngine::parse_select(const std::string& sql, SelectPlan& plan, std::string& error) const {
     plan = SelectPlan{};
 
-    std::string s = trim(sql);
+    const std::string& s = sql;
     std::string upper = to_upper(s);
     if (!starts_with_keyword(upper, kSelectKw)) {
         error = "expected SELECT statement";
@@ -2238,11 +2243,15 @@ const SqlEngine::Column* SqlEngine::lookup_column(const Table& table,
                                                    const std::string& col_ref,
                                                    std::size_t& idx,
                                                    std::string& error) const {
-    std::string key = to_lower(col_ref);
-    auto it = table.column_index.find(key);
+    // Fast path: check if already lowercase (common case)
+    auto it = table.column_index.find(col_ref);
     if (it == table.column_index.end()) {
-        error = "unknown column " + col_ref + " in table " + table.name;
-        return nullptr;
+        std::string key = to_lower(col_ref);
+        it = table.column_index.find(key);
+        if (it == table.column_index.end()) {
+            error = "unknown column " + col_ref + " in table " + table.name;
+            return nullptr;
+        }
     }
     idx = it->second;
     return &table.columns[idx];
