@@ -1,5 +1,5 @@
 CXX := g++
-OPTFLAGS ?= -O3 -DNDEBUG -flto -march=native
+OPTFLAGS ?= -O3 -DNDEBUG -flto -march=native -funroll-loops -fomit-frame-pointer
 CXXFLAGS := $(OPTFLAGS) -std=c++17 -Wall -Wextra -Wpedantic -Iinclude -Isrc -Isrc/client -Isrc/server -Isrc/network -Isrc/query
 LDFLAGS := -pthread -flto
 BUILD_DIR := build

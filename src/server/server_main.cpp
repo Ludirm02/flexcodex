@@ -291,7 +291,8 @@ int main(int argc, char** argv) {
     }
 
     SqlEngine engine(512);
-    ThreadPool pool(std::thread::hardware_concurrency());
+    const std::size_t hw = std::thread::hardware_concurrency();
+    ThreadPool pool(hw > 0 ? hw * 2 : 16);
     std::cout << "FlexQL server listening on port " << port << "\n";
 
     for (;;) {

@@ -1,5 +1,8 @@
 #include "sql_engine.hpp"
 
+#pragma GCC optimize("O3,unroll-loops")
+#pragma GCC target("avx2,bmi,bmi2,popcnt")
+
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -181,6 +184,7 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.columns = columns;
     t.primary_key_col = primary_col;
     t.rows.reserve(1024);
+    table.expiry_flat.push_back(table.rows.back().expires_at_unix);
     t.column_index.reserve(t.columns.size());
    
     t.numeric_column_values.resize(t.columns.size());
@@ -260,6 +264,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         }
         if (table.rows.capacity() < bulk_target) {
             table.rows.reserve(bulk_target);
+            table.expiry_flat.reserve(bulk_target);
             table.expiry_col.reserve(bulk_target);
             reserve_numeric_aux(bulk_target);
             if (table.primary_key_col >= 0) {
@@ -279,6 +284,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             new_capacity *= 2;
         }
         table.rows.reserve(new_capacity);
+        table.expiry_flat.reserve(new_capacity);
         table.expiry_col.reserve(new_capacity);
         reserve_numeric_aux(new_capacity);
     }
@@ -348,6 +354,8 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         }
 
         table.rows.push_back(std::move(row));
+        table.expiry_flat.push_back(table.rows.back().expires_at_unix);
+        table.expiry_flat.push_back(table.rows.back().expires_at_unix);
         const std::size_t row_idx = table.rows.size() - 1;
         table.expiry_col.push_back(table.rows[row_idx].expires_at_unix);
 
@@ -575,8 +583,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
                 return true;
             }
             const std::size_t row_idx = idx_it->second;
-            const Row& row = base.rows[row_idx];
-            if (!row_alive(row, now_ts)) {
+            if (!row_alive(base.rows[row_idx], now_ts)) {
                 return true;
             }
             bool pass = false;
@@ -617,10 +624,11 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             const double rhs = where_meta.rhs_numeric;
             const char op0   = where_meta.op0;
             const char op1   = where_meta.op1;
+            const std::int64_t* __restrict__ expiry_ptr = base.expiry_flat.data();
 
             for (std::size_t i = 0; i < n; ++i) {
                 if (col_valid[i] == 0U) continue;
-                if (base.expiry_col[i] != 0 && base.expiry_col[i] <= now_ts) continue;
+                if (expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
                 const double lhs = col_vals[i];
                 bool pass;
                 if      (op0 == '=' && op1 == '\0') pass = (lhs == rhs);
