@@ -183,10 +183,7 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.name = table_name;
     t.columns = columns;
     t.primary_key_col = primary_col;
-    t.rows.reserve(1024);
-    table.expiry_flat.push_back(table.rows.back().expires_at_unix);
-    t.column_index.reserve(t.columns.size());
-   
+    
     t.numeric_column_values.resize(t.columns.size());
     t.numeric_column_valid.resize(t.columns.size());
     if (primary_col >= 0) {
@@ -265,7 +262,6 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         if (table.rows.capacity() < bulk_target) {
             table.rows.reserve(bulk_target);
             table.expiry_flat.reserve(bulk_target);
-            table.expiry_col.reserve(bulk_target);
             reserve_numeric_aux(bulk_target);
             if (table.primary_key_col >= 0) {
                 if (table.pk_is_int) {
@@ -285,7 +281,6 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         }
         table.rows.reserve(new_capacity);
         table.expiry_flat.reserve(new_capacity);
-        table.expiry_col.reserve(new_capacity);
         reserve_numeric_aux(new_capacity);
     }
 
@@ -353,11 +348,8 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
         }
 
-        table.rows.push_back(std::move(row));
-        table.expiry_flat.push_back(table.rows.back().expires_at_unix);
         table.expiry_flat.push_back(table.rows.back().expires_at_unix);
         const std::size_t row_idx = table.rows.size() - 1;
-        table.expiry_col.push_back(table.rows[row_idx].expires_at_unix);
 
         if (table.primary_key_col >= 0) {
             if (table.pk_is_int) {
@@ -618,7 +610,8 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             if (col_vals.empty()) {
                 return true;
             }
-
+            // Safety: expiry_flat must match rows size, fall back if not
+            const std::int64_t* __restrict__ expiry_ptr = base.expiry_flat.data();
             out.rows.reserve(std::max<std::size_t>(1024, n / 2));
 
             const double rhs = where_meta.rhs_numeric;
@@ -628,7 +621,8 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
 
             for (std::size_t i = 0; i < n; ++i) {
                 if (col_valid[i] == 0U) continue;
-                if (expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
+                if (expiry_ptr && expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
+                if (!expiry_ptr) { const auto& r = base.rows[i]; if (r.expires_at_unix != 0 && r.expires_at_unix <= now_ts) continue; }
                 const double lhs = col_vals[i];
                 bool pass;
                 if      (op0 == '=' && op1 == '\0') pass = (lhs == rhs);
@@ -650,7 +644,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
             if (!used_numeric_index) {
                 for (std::size_t row_idx = 0; row_idx < base.rows.size(); ++row_idx) {
-                    if (row_idx < base.expiry_col.size() && base.expiry_col[row_idx] != 0 && base.expiry_col[row_idx] <= now_ts) {
+                    if (row_idx < base.expiry_flat.size() && base.expiry_flat[row_idx] != 0 && base.expiry_flat[row_idx] <= now_ts) {
                         continue;
                     }
                     const Row& row = base.rows[row_idx];
@@ -1215,7 +1209,8 @@ bool SqlEngine::parse_insert(const std::string& sql,
         return false;
     }
 
-    std::string table_part = trim(s.substr(std::strlen(kInsertIntoKw), values_kw - std::strlen(kInsertIntoKw)));    if (!is_identifier(table_part)) {
+    std::string table_part = trim(s.substr(std::strlen(kInsertIntoKw), values_kw - std::strlen(kInsertIntoKw)));
+    if (!is_identifier(table_part)) {
         error = "invalid table name in INSERT";
         return false;
     }
