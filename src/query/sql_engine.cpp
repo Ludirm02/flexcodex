@@ -262,7 +262,11 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             table.rows.reserve(bulk_target);
             reserve_numeric_aux(bulk_target);
             if (table.primary_key_col >= 0) {
-                table.primary_index.reserve(static_cast<std::size_t>(static_cast<double>(bulk_target) / 0.70));
+                if (table.pk_is_int) {
+                    table.primary_index_int.reserve(static_cast<std::size_t>(bulk_target / 0.70));
+                } else {
+                    table.primary_index.reserve(static_cast<std::size_t>(bulk_target / 0.70));
+                }
             }
         }
     }
@@ -892,11 +896,23 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         hash_is_base = false;
     }
 
-    // Use int64 hash map for INT joins — avoids string allocation entirely
+    // Use int64 hash map for INT joins only when both join columns are fully numeric-backed.
     std::unordered_map<std::int64_t, std::vector<std::size_t>> join_hash_int;
     std::unordered_map<std::string, std::vector<std::size_t>> join_hash_str;
     const bool join_use_int = (join_cmp_type == DataType::kInt);
-    if (join_use_int) {
+    const bool hash_int_backed = join_use_int &&
+        hash_idx < hash_table->numeric_column_valid.size() &&
+        hash_idx < hash_table->numeric_column_values.size() &&
+        hash_table->numeric_column_valid[hash_idx].size() == hash_table->rows.size() &&
+        hash_table->numeric_column_values[hash_idx].size() == hash_table->rows.size();
+    const bool probe_int_backed = join_use_int &&
+        probe_idx < probe_table->numeric_column_valid.size() &&
+        probe_idx < probe_table->numeric_column_values.size() &&
+        probe_table->numeric_column_valid[probe_idx].size() == probe_table->rows.size() &&
+        probe_table->numeric_column_values[probe_idx].size() == probe_table->rows.size();
+    const bool join_use_int_fast = hash_int_backed && probe_int_backed;
+
+    if (join_use_int_fast) {
         join_hash_int.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
     } else {
         join_hash_str.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
@@ -905,9 +921,10 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
     for (std::size_t hash_row_idx = 0; hash_row_idx < hash_table->rows.size(); ++hash_row_idx) {
         const Row& row = hash_table->rows[hash_row_idx];
         if (!row_alive(row, now_ts)) continue;
-        if (join_use_int && hash_idx < hash_table->numeric_column_valid.size() &&
-            hash_row_idx < hash_table->numeric_column_valid[hash_idx].size() &&
-            hash_table->numeric_column_valid[hash_idx][hash_row_idx] != 0U) {
+        if (join_use_int_fast) {
+            if (hash_table->numeric_column_valid[hash_idx][hash_row_idx] == 0U) {
+                continue;
+            }
             std::int64_t k = static_cast<std::int64_t>(hash_table->numeric_column_values[hash_idx][hash_row_idx]);
             join_hash_int[k].push_back(hash_row_idx);
         } else {
@@ -925,16 +942,11 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             continue;
         }
 
-        std::string key;
-        if (!make_join_key(*probe_table, probe_row_idx, probe_idx, key)) {
-            error = "failed to compute join key";
-            return false;
-        }
-
         std::vector<std::size_t>* hit_rows = nullptr;
-        if (join_use_int && probe_idx < probe_table->numeric_column_valid.size() &&
-            probe_row_idx < probe_table->numeric_column_valid[probe_idx].size() &&
-            probe_table->numeric_column_valid[probe_idx][probe_row_idx] != 0U) {
+        if (join_use_int_fast) {
+            if (probe_table->numeric_column_valid[probe_idx][probe_row_idx] == 0U) {
+                continue;
+            }
             std::int64_t k = static_cast<std::int64_t>(probe_table->numeric_column_values[probe_idx][probe_row_idx]);
             auto hit = join_hash_int.find(k);
             if (hit != join_hash_int.end()) hit_rows = &hit->second;
