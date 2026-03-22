@@ -55,6 +55,7 @@ private:
         std::vector<std::vector<double>> numeric_column_values;
         std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
+        std::vector<std::int64_t> expiry_col;  // parallel to rows — flat expiry array
         std::uint64_t version = 1;
     };
 
