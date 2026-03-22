@@ -186,7 +186,12 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     t.numeric_column_values.resize(t.columns.size());
     t.numeric_column_valid.resize(t.columns.size());
     if (primary_col >= 0) {
-        t.primary_index.reserve(1024);
+        if (columns[static_cast<std::size_t>(primary_col)].type == DataType::kInt) {
+            t.pk_is_int = true;
+            t.primary_index_int.reserve(1024);
+        } else {
+            t.primary_index.reserve(1024);
+        }
     }
 
     for (std::size_t i = 0; i < t.columns.size(); ++i) {
@@ -273,14 +278,19 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     }
 
     if (table.primary_key_col >= 0) {
-        const std::size_t projected = table.primary_index.size() + rows_values.size();
-        const std::size_t buckets = table.primary_index.bucket_count();
+        const std::size_t cur_size = table.pk_is_int ? table.primary_index_int.size() : table.primary_index.size();
+        const std::size_t buckets = table.pk_is_int ? table.primary_index_int.bucket_count() : table.primary_index.bucket_count();
+        const std::size_t projected = cur_size + rows_values.size();
         if (buckets == 0 || projected > static_cast<std::size_t>(static_cast<double>(buckets) * 0.70)) {
             std::size_t target = std::max<std::size_t>(1024, buckets == 0 ? projected * 2 : buckets * 2);
             if (target < projected * 2) {
                 target = projected * 2;
             }
-            table.primary_index.reserve(target);
+            if (table.pk_is_int) {
+                table.primary_index_int.reserve(target);
+            } else {
+                table.primary_index.reserve(target);
+            }
         }
     }
 
@@ -314,12 +324,25 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
 
         if (table.primary_key_col >= 0) {
             pk_key = row.values[static_cast<std::size_t>(table.primary_key_col)];
-            auto idx_it = table.primary_index.find(pk_key);
-            if (idx_it != table.primary_index.end()) {
-                std::size_t row_idx = idx_it->second;
-                if (row_idx < table.rows.size() && row_alive(table.rows[row_idx], now_ts)) {
-                    error = "duplicate primary key value: " + pk_key;
-                    return false;
+            if (table.pk_is_int) {
+                std::int64_t pk_int = 0;
+                fast_parse_int64(pk_key, pk_int);
+                auto idx_it = table.primary_index_int.find(pk_int);
+                if (idx_it != table.primary_index_int.end()) {
+                    std::size_t row_idx = idx_it->second;
+                    if (row_idx < table.rows.size() && row_alive(table.rows[row_idx], now_ts)) {
+                        error = "duplicate primary key value: " + pk_key;
+                        return false;
+                    }
+                }
+            } else {
+                auto idx_it = table.primary_index.find(pk_key);
+                if (idx_it != table.primary_index.end()) {
+                    std::size_t row_idx = idx_it->second;
+                    if (row_idx < table.rows.size() && row_alive(table.rows[row_idx], now_ts)) {
+                        error = "duplicate primary key value: " + pk_key;
+                        return false;
+                    }
                 }
             }
         }
@@ -328,7 +351,13 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         const std::size_t row_idx = table.rows.size() - 1;
 
         if (table.primary_key_col >= 0) {
-            table.primary_index[pk_key] = row_idx;
+            if (table.pk_is_int) {
+                std::int64_t pk_int = 0;
+                fast_parse_int64(pk_key, pk_int);
+                table.primary_index_int[pk_int] = row_idx;
+            } else {
+                table.primary_index[pk_key] = row_idx;
+            }
         }
 
         for (std::size_t i = 0; i < table.columns.size(); ++i) {
@@ -463,15 +492,19 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             out.rows.reserve(std::max<std::size_t>(1024, base.rows.size() / 2));
         }
 
-        std::vector<std::string> projected_buf;
-        projected_buf.resize(selected_indexes.size());
-        
+        const std::size_t proj_count = selected_indexes.size();
+        std::vector<std::string> projected_buf(proj_count);
+
         auto emit_projected_row = [&](std::size_t row_idx) {
             const Row& row = base.rows[row_idx];
-            for (std::size_t i = 0; i < selected_indexes.size(); ++i) {
-                projected_buf[i] = row.values[selected_indexes[i]];
+            if (plan.select_star) {
+                out.rows.push_back(row.values);
+            } else {
+                for (std::size_t i = 0; i < proj_count; ++i) {
+                    projected_buf[i] = row.values[selected_indexes[i]];
+                }
+                out.rows.push_back(projected_buf);
             }
-            out.rows.push_back(projected_buf);
         };
 
         auto fast_numeric_value = [&](std::size_t row_idx, std::size_t col_idx, double& out_num) -> bool {
@@ -525,6 +558,19 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
                 return false;
             }
 
+            if (base.pk_is_int && where_meta.rhs_numeric_valid) {
+                std::int64_t pk_int = static_cast<std::int64_t>(where_meta.rhs_numeric);
+                auto idx_it = base.primary_index_int.find(pk_int);
+                if (idx_it == base.primary_index_int.end() || idx_it->second >= base.rows.size()) {
+                    return true;
+                }
+                const std::size_t row_idx = idx_it->second;
+                if (!row_alive(base.rows[row_idx], now_ts)) return true;
+                bool pass = false;
+                if (!passes_where(row_idx, pass)) return true;
+                if (pass) emit_projected_row(row_idx);
+                return true;
+            }
             const std::string& key = where_meta.rhs_unquoted;
             auto idx_it = base.primary_index.find(key);
             if (idx_it == base.primary_index.end() || idx_it->second >= base.rows.size()) {
@@ -535,7 +581,6 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             if (!row_alive(row, now_ts)) {
                 return true;
             }
-
             bool pass = false;
             if (!passes_where(row_idx, pass)) {
                 return true;
@@ -571,22 +616,22 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
 
             out.rows.reserve(std::max<std::size_t>(1024, n / 2));
 
-            const double rhs      = where_meta.rhs_numeric;
-            const std::string& op = where_meta.op;
+            const double rhs = where_meta.rhs_numeric;
+            const char op0   = where_meta.op0;
+            const char op1   = where_meta.op1;
 
             for (std::size_t i = 0; i < n; ++i) {
                 if (col_valid[i] == 0U) continue;
-                // Fast expiry check inline — avoids function call overhead
                 const auto& r = base.rows[i];
                 if (r.expires_at_unix != 0 && r.expires_at_unix <= now_ts) continue;
                 const double lhs = col_vals[i];
-                bool pass = false;
-                if      (op == "=" )  pass = (lhs == rhs);
-                else if (op == "!=")  pass = (lhs != rhs);
-                else if (op == ">" )  pass = (lhs >  rhs);
-                else if (op == ">=")  pass = (lhs >= rhs);
-                else if (op == "<" )  pass = (lhs <  rhs);
-                else if (op == "<=")  pass = (lhs <= rhs);
+                bool pass;
+                if      (op0 == '=' && op1 == '\0') pass = (lhs == rhs);
+                else if (op0 == '!')                pass = (lhs != rhs);
+                else if (op0 == '>' && op1 == '\0') pass = (lhs >  rhs);
+                else if (op0 == '>' && op1 == '=')  pass = (lhs >= rhs);
+                else if (op0 == '<' && op1 == '\0') pass = (lhs <  rhs);
+                else                                pass = (lhs <= rhs);
                 if (!pass) continue;
                 emit_projected_row(i);
             }
@@ -847,20 +892,31 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         hash_is_base = false;
     }
 
-    std::unordered_map<std::string, std::vector<std::size_t>> join_hash;
-    join_hash.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
+    // Use int64 hash map for INT joins — avoids string allocation entirely
+    std::unordered_map<std::int64_t, std::vector<std::size_t>> join_hash_int;
+    std::unordered_map<std::string, std::vector<std::size_t>> join_hash_str;
+    const bool join_use_int = (join_cmp_type == DataType::kInt);
+    if (join_use_int) {
+        join_hash_int.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
+    } else {
+        join_hash_str.reserve(hash_table->rows.size() > 0 ? hash_table->rows.size() : 1);
+    }
 
     for (std::size_t hash_row_idx = 0; hash_row_idx < hash_table->rows.size(); ++hash_row_idx) {
         const Row& row = hash_table->rows[hash_row_idx];
-        if (!row_alive(row, now_ts)) {
-            continue;
+        if (!row_alive(row, now_ts)) continue;
+        if (join_use_int && hash_idx < hash_table->numeric_column_valid.size() &&
+            hash_row_idx < hash_table->numeric_column_valid[hash_idx].size() &&
+            hash_table->numeric_column_valid[hash_idx][hash_row_idx] != 0U) {
+            std::int64_t k = static_cast<std::int64_t>(hash_table->numeric_column_values[hash_idx][hash_row_idx]);
+            join_hash_int[k].push_back(hash_row_idx);
+        } else {
+            std::string key;
+            if (!make_join_key(*hash_table, hash_row_idx, hash_idx, key)) {
+                error = "failed to compute join key"; return false;
+            }
+            join_hash_str[key].push_back(hash_row_idx);
         }
-        std::string key;
-        if (!make_join_key(*hash_table, hash_row_idx, hash_idx, key)) {
-            error = "failed to compute join key";
-            return false;
-        }
-        join_hash[key].push_back(hash_row_idx);
     }
 
     for (std::size_t probe_row_idx = 0; probe_row_idx < probe_table->rows.size(); ++probe_row_idx) {
@@ -875,12 +931,24 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             return false;
         }
 
-        auto hit = join_hash.find(key);
-        if (hit == join_hash.end()) {
-            continue;
+        std::vector<std::size_t>* hit_rows = nullptr;
+        if (join_use_int && probe_idx < probe_table->numeric_column_valid.size() &&
+            probe_row_idx < probe_table->numeric_column_valid[probe_idx].size() &&
+            probe_table->numeric_column_valid[probe_idx][probe_row_idx] != 0U) {
+            std::int64_t k = static_cast<std::int64_t>(probe_table->numeric_column_values[probe_idx][probe_row_idx]);
+            auto hit = join_hash_int.find(k);
+            if (hit != join_hash_int.end()) hit_rows = &hit->second;
+        } else {
+            std::string key;
+            if (!make_join_key(*probe_table, probe_row_idx, probe_idx, key)) {
+                error = "failed to compute join key"; return false;
+            }
+            auto hit = join_hash_str.find(key);
+            if (hit != join_hash_str.end()) hit_rows = &hit->second;
         }
+        if (!hit_rows) continue;
 
-        for (std::size_t matched_row_idx : hit->second) {
+        for (std::size_t matched_row_idx : *hit_rows) {
             const std::size_t base_row_idx = hash_is_base ? matched_row_idx : probe_row_idx;
             const std::size_t right_row_idx = hash_is_base ? probe_row_idx : matched_row_idx;
             const Row* base_row_ptr = &base.rows[base_row_idx];

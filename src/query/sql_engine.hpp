@@ -49,6 +49,8 @@ private:
         std::unordered_map<std::string, std::size_t> column_index;
         int primary_key_col = -1;
         std::unordered_map<std::string, std::size_t> primary_index;
+        std::unordered_map<std::int64_t, std::size_t> primary_index_int;
+        bool pk_is_int = false;
         std::vector<std::vector<double>> numeric_column_values;
         std::vector<std::vector<std::uint8_t>> numeric_column_valid;
         std::vector<Row> rows;
