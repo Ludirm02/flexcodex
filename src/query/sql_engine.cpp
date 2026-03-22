@@ -188,7 +188,7 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     if (primary_col >= 0) {
         if (columns[static_cast<std::size_t>(primary_col)].type == DataType::kInt) {
             t.pk_is_int = true;
-            t.primary_index_int.reserve(1024);
+            t.pk_robin_index.reserve(1024);
         } else {
             t.primary_index.reserve(1024);
         }
@@ -263,7 +263,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             reserve_numeric_aux(bulk_target);
             if (table.primary_key_col >= 0) {
                 if (table.pk_is_int) {
-                    table.primary_index_int.reserve(static_cast<std::size_t>(bulk_target / 0.70));
+                    table.pk_robin_index.reserve(bulk_target);
                 } else {
                     table.primary_index.reserve(static_cast<std::size_t>(bulk_target / 0.70));
                 }
@@ -282,17 +282,13 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     }
 
     if (table.primary_key_col >= 0) {
-        const std::size_t cur_size = table.pk_is_int ? table.primary_index_int.size() : table.primary_index.size();
-        const std::size_t buckets = table.pk_is_int ? table.primary_index_int.bucket_count() : table.primary_index.bucket_count();
-        const std::size_t projected = cur_size + rows_values.size();
-        if (buckets == 0 || projected > static_cast<std::size_t>(static_cast<double>(buckets) * 0.70)) {
-            std::size_t target = std::max<std::size_t>(1024, buckets == 0 ? projected * 2 : buckets * 2);
-            if (target < projected * 2) {
-                target = projected * 2;
-            }
-            if (table.pk_is_int) {
-                table.primary_index_int.reserve(target);
-            } else {
+        if (!table.pk_is_int) {
+            const std::size_t cur_size = table.primary_index.size();
+            const std::size_t buckets = table.primary_index.bucket_count();
+            const std::size_t projected = cur_size + rows_values.size();
+            if (buckets == 0 || projected > static_cast<std::size_t>(static_cast<double>(buckets) * 0.70)) {
+                std::size_t target = std::max<std::size_t>(1024, buckets == 0 ? projected * 2 : buckets * 2);
+                if (target < projected * 2) target = projected * 2;
                 table.primary_index.reserve(target);
             }
         }
@@ -331,13 +327,11 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             pk_key = row.values[static_cast<std::size_t>(table.primary_key_col)];
             if (table.pk_is_int) {
                 fast_parse_int64(pk_key, pk_int_val);
-                auto idx_it = table.primary_index_int.find(pk_int_val);
-                if (idx_it != table.primary_index_int.end()) {
-                    std::size_t row_idx = idx_it->second;
-                    if (row_idx < table.rows.size() && row_alive(table.rows[row_idx], now_ts)) {
-                        error = "duplicate primary key value: " + pk_key;
-                        return false;
-                    }
+                auto existing = table.pk_robin_index.lookup(pk_int_val);
+                if (existing != RobinHoodIndex::kEmpty && existing < table.rows.size()
+                    && row_alive(table.rows[existing], now_ts)) {
+                    error = "duplicate primary key value: " + pk_key;
+                    return false;
                 }
             } else {
                 auto idx_it = table.primary_index.find(pk_key);
@@ -356,7 +350,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
 
         if (table.primary_key_col >= 0) {
             if (table.pk_is_int) {
-                table.primary_index_int[pk_int_val] = row_idx;
+                table.pk_robin_index.insert(pk_int_val, row_idx);
             } else {
                 table.primary_index[pk_key] = row_idx;
             }
@@ -562,11 +556,10 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
 
             if (base.pk_is_int && where_meta.rhs_numeric_valid) {
                 std::int64_t pk_int = static_cast<std::int64_t>(where_meta.rhs_numeric);
-                auto idx_it = base.primary_index_int.find(pk_int);
-                if (idx_it == base.primary_index_int.end() || idx_it->second >= base.rows.size()) {
+                auto row_idx = base.pk_robin_index.lookup(pk_int);
+                if (row_idx == RobinHoodIndex::kEmpty || row_idx >= base.rows.size()) {
                     return true;
                 }
-                const std::size_t row_idx = idx_it->second;
                 if (!row_alive(base.rows[row_idx], now_ts)) return true;
                 bool pass = false;
                 if (!passes_where(row_idx, pass)) return true;
