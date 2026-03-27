@@ -29,6 +29,11 @@ public:
     explicit SqlEngine(std::size_t cache_capacity = 256);
 
     bool execute(const std::string& sql, QueryResult& out, std::string& error);
+    bool execute(const std::string& sql,
+                 QueryResult& out,
+                 std::string& error,
+                 std::string* cached_wire_out,
+                 bool binary_wire = false);
 
 private:
     struct Column {
@@ -48,6 +53,7 @@ private:
         std::string name;
         std::vector<Column> columns;
         std::unordered_map<std::string, std::size_t> column_index;
+        mutable std::shared_mutex mutex;
         int primary_key_col = -1;
         std::unordered_map<std::string, std::size_t> primary_index;
         RobinHoodIndex pk_robin_index;
@@ -76,11 +82,18 @@ private:
         std::vector<std::string> select_columns;
         bool select_star = false;
         Condition where;
+        struct {
+            bool present = false;
+            std::string column;
+            bool descending = false;
+        } order_by;
         std::vector<std::string> touched_tables;
     };
 
     struct CacheEntry {
         QueryResult result;
+        std::string wire_bytes;
+        std::string wire_bytes_bin;
         std::unordered_map<std::string, std::uint64_t> versions;
         std::size_t approx_bytes = 0;
     };
@@ -90,10 +103,13 @@ private:
         explicit QueryCache(std::size_t capacity);
         bool get(const std::string& key,
                  const std::unordered_map<std::string, std::uint64_t>& current_versions,
-                 QueryResult& out);
+                 QueryResult* out = nullptr,
+                 std::string* wire_out = nullptr,
+                 bool binary_wire = false);
         void put(const std::string& key,
                  const QueryResult& result,
-                 const std::unordered_map<std::string, std::uint64_t>& versions);
+                 const std::unordered_map<std::string, std::uint64_t>& versions,
+                 bool binary_wire = false);
 
     private:
         std::size_t capacity_;
@@ -108,7 +124,13 @@ private:
 
     bool execute_create_table(const std::string& sql, std::string& error);
     bool execute_insert(const std::string& sql, std::string& error);
-    bool execute_select(const std::string& sql, QueryResult& out, std::string& error);
+    bool execute_select(const std::string& sql,
+                        QueryResult& out,
+                        std::string& error,
+                        std::string* cached_wire_out = nullptr,
+                        bool binary_wire = false);
+
+    bool execute_delete(const std::string& sql, std::string& error);
 
     bool parse_create_table(const std::string& sql,
                             std::string& table_name,
@@ -172,6 +194,9 @@ private:
                                   std::size_t row_idx,
                                   std::size_t col_idx,
                                   double& out);
+    std::string cell_value_string(const Table& table,
+                                  std::size_t row_idx,
+                                  std::size_t col_idx) const;
 
     bool validate_typed_value(const Column& col,
                               std::string& value,

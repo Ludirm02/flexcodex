@@ -58,7 +58,7 @@ bool fill_reader_state(int fd, ReaderState& state) {
 bool send_all(int fd, const char* data, std::size_t len) {
     std::size_t sent = 0;
     while (sent < len) {
-        ssize_t n = ::send(fd, data + sent, len - sent, 0);
+        ssize_t n = ::send(fd, data + sent, len - sent, MSG_NOSIGNAL);
         if (n < 0) {
             if (errno == EINTR) {
                 continue;
@@ -225,8 +225,8 @@ std::vector<std::string> split_tab_escaped(const std::string& line, std::size_t 
     return out;
 }
 
-bool send_query(int fd, const std::string& sql) {
-    const std::string header = "Q " + std::to_string(sql.size()) + "\n";
+bool send_query(int fd, const std::string& sql, bool want_binary) {
+    const std::string header = std::string(want_binary ? "QB " : "Q ") + std::to_string(sql.size()) + "\n";
     if (!send_all(fd, header.data(), header.size())) {
         return false;
     }

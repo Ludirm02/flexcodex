@@ -1,7 +1,7 @@
 CXX := g++
-OPTFLAGS ?= -O3 -DNDEBUG -flto -march=native -funroll-loops -fomit-frame-pointer
+OPTFLAGS ?= -O3 -DNDEBUG -flto -march=native -funroll-loops -fomit-frame-pointer -ffast-math -ftree-vectorize -fopenmp
 CXXFLAGS := $(OPTFLAGS) -std=c++17 -Wall -Wextra -Wpedantic -Iinclude -Isrc -Isrc/client -Isrc/server -Isrc/network -Isrc/query
-LDFLAGS := -pthread -flto
+LDFLAGS := -pthread -flto -fopenmp
 BUILD_DIR := build
 BIN_DIR := bin
 
@@ -29,7 +29,7 @@ $(BUILD_DIR)/flexql_repl: $(BUILD_DIR)/flexql-client | $(BUILD_DIR)
 $(BUILD_DIR)/flexql_smoke_test: tests/smoke_test.cpp $(CLIENT_SRCS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
-$(BUILD_DIR)/flexql_benchmark: tests/benchmark_client.cpp $(CLIENT_SRCS) | $(BUILD_DIR)
+$(BUILD_DIR)/flexql_benchmark: tests/benchmark_flexql.cpp $(CLIENT_SRCS) | $(BUILD_DIR)
 	$(CXX) $(CXXFLAGS) $^ -o $@
 
 $(BIN_DIR)/flexql_server: $(BUILD_DIR)/flexql_server | $(BIN_DIR)

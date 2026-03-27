@@ -3,6 +3,7 @@
 #pragma GCC optimize("O3,unroll-loops")
 #pragma GCC target("avx2,bmi,bmi2,popcnt")
 
+#include <arpa/inet.h>
 #include <algorithm>
 #include <charconv>
 #include <chrono>
@@ -66,6 +67,122 @@ std::size_t estimate_query_result_bytes(const QueryResult& result) {
     return bytes;
 }
 
+bool starts_with_ci(const char* s, const char* kw) {
+    while (*kw != '\0') {
+        if (*s == '\0') {
+            return false;
+        }
+        if (std::toupper(static_cast<unsigned char>(*s)) !=
+            std::toupper(static_cast<unsigned char>(*kw))) {
+            return false;
+        }
+        ++s;
+        ++kw;
+    }
+    return true;
+}
+
+const char* find_keyword_ci(const char* start, const char* kw) {
+    const std::size_t kw_len = std::strlen(kw);
+    if (kw_len == 0) {
+        return start;
+    }
+
+    for (const char* p = start; *p != '\0'; ++p) {
+        if (!starts_with_ci(p, kw)) {
+            continue;
+        }
+        const bool left_ok = (p == start) || is_space_char(*(p - 1)) || *(p - 1) == ')';
+        const char right = p[kw_len];
+        const bool right_ok = (right == '\0') || is_space_char(right) || right == '(';
+        if (left_ok && right_ok) {
+            return p;
+        }
+    }
+    return nullptr;
+}
+
+void append_escaped_field_wire(std::string& out, const std::string& value) {
+    bool needs_escape = false;
+    for (char c : value) {
+        if (c == '\\' || c == '\t' || c == '\n') {
+            needs_escape = true;
+            break;
+        }
+    }
+    if (!needs_escape) {
+        out += value;
+        return;
+    }
+    for (char c : value) {
+        if (c == '\\') {
+            out += "\\\\";
+        } else if (c == '\t') {
+            out += "\\t";
+        } else if (c == '\n') {
+            out += "\\n";
+        } else {
+            out.push_back(c);
+        }
+    }
+}
+
+void append_line_with_fields_wire(std::string& out,
+                                  const char* prefix,
+                                  const std::vector<std::string>& fields) {
+    out += prefix;
+    for (const std::string& f : fields) {
+        out.push_back('\t');
+        append_escaped_field_wire(out, f);
+    }
+    out.push_back('\n');
+}
+
+std::string build_wire_bytes(const QueryResult& result) {
+    std::string wire;
+    wire.reserve(64 + result.rows.size() * 32);
+    wire += "OK " + std::to_string(result.columns.size()) + "\n";
+    if (result.columns.empty()) {
+        wire += "END\n";
+        return wire;
+    }
+    append_line_with_fields_wire(wire, "COL", result.columns);
+    for (const auto& row : result.rows) {
+        append_line_with_fields_wire(wire, "ROW", row);
+    }
+    wire += "END\n";
+    return wire;
+}
+
+inline void append_u16_be(std::string& out, std::uint16_t v) {
+    const std::uint16_t be = htons(v);
+    out.append(reinterpret_cast<const char*>(&be), sizeof(be));
+}
+
+inline void append_u32_be(std::string& out, std::uint32_t v) {
+    const std::uint32_t be = htonl(v);
+    out.append(reinterpret_cast<const char*>(&be), sizeof(be));
+}
+
+std::string build_wire_bytes_binary(const QueryResult& result) {
+    std::string wire;
+    wire.reserve(1 + 4 + 4 + result.columns.size() * 8 + result.rows.size() * 16);
+    wire.push_back(static_cast<char>(0x01));  // OK frame
+    append_u32_be(wire, static_cast<std::uint32_t>(result.columns.size()));
+    append_u32_be(wire, static_cast<std::uint32_t>(result.rows.size()));
+    for (const std::string& c : result.columns) {
+        append_u16_be(wire, static_cast<std::uint16_t>(std::min<std::size_t>(c.size(), 0xFFFF)));
+        wire.append(c.data(), std::min<std::size_t>(c.size(), 0xFFFF));
+    }
+    for (const auto& row : result.rows) {
+        for (const std::string& v : row) {
+            append_u32_be(wire, static_cast<std::uint32_t>(v.size()));
+            wire.append(v.data(), v.size());
+        }
+    }
+    return wire;
+}
+
 }  // namespace
 
 SqlEngine::QueryCache::QueryCache(std::size_t capacity)
@@ -74,14 +191,16 @@ SqlEngine::QueryCache::QueryCache(std::size_t capacity)
 
 bool SqlEngine::QueryCache::get(const std::string& key,
                                 const std::unordered_map<std::string, std::uint64_t>& current_versions,
-                                QueryResult& out) {
+                                QueryResult* out,
+                                std::string* wire_out,
+                                bool binary_wire) {
     std::lock_guard<std::mutex> lock(mutex_);
     auto it = map_.find(key);
     if (it == map_.end()) {
         return false;
     }
 
-    const CacheEntry& entry = it->second->second;
+    CacheEntry& entry = it->second->second;
     if (entry.versions != current_versions) {
         current_bytes_ -= entry.approx_bytes;
         entries_.erase(it->second);
@@ -89,15 +208,29 @@ bool SqlEngine::QueryCache::get(const std::string& key,
         return false;
     }
 
-    out = entry.result;
+    if (out != nullptr) {
+        *out = entry.result;
+    }
+    if (wire_out != nullptr) {
+        *wire_out = binary_wire ? entry.wire_bytes_bin : entry.wire_bytes;
+    }
     entries_.splice(entries_.begin(), entries_, it->second);
     return true;
 }
 
 void SqlEngine::QueryCache::put(const std::string& key,
                                 const QueryResult& result,
-                                const std::unordered_map<std::string, std::uint64_t>& versions) {
-    const std::size_t approx_bytes = estimate_query_result_bytes(result);
+                                const std::unordered_map<std::string, std::uint64_t>& versions,
+                                bool binary_wire) {
+    std::string wire_bytes;
+    std::string wire_bytes_bin;
+    if (binary_wire) {
+        wire_bytes_bin = build_wire_bytes_binary(result);
+    } else {
+        wire_bytes = build_wire_bytes(result);
+    }
+    const std::size_t approx_bytes = estimate_query_result_bytes(result) +
+                                     wire_bytes.size() + wire_bytes_bin.size();
     if (approx_bytes > 256ULL * 1024 * 1024) {
         return;
     }
@@ -107,12 +240,15 @@ void SqlEngine::QueryCache::put(const std::string& key,
     if (it != map_.end()) {
         current_bytes_ -= it->second->second.approx_bytes;
         it->second->second.result = result;
+        it->second->second.wire_bytes = std::move(wire_bytes);
+        it->second->second.wire_bytes_bin = std::move(wire_bytes_bin);
         it->second->second.versions = versions;
         it->second->second.approx_bytes = approx_bytes;
         current_bytes_ += approx_bytes;
         entries_.splice(entries_.begin(), entries_, it->second);
     } else {
-        entries_.push_front({key, CacheEntry{result, versions, approx_bytes}});
+        entries_.push_front(
+            {key, CacheEntry{result, std::move(wire_bytes), std::move(wire_bytes_bin), versions, approx_bytes}});
         map_[key] = entries_.begin();
         current_bytes_ += approx_bytes;
     }
@@ -128,8 +264,19 @@ void SqlEngine::QueryCache::put(const std::string& key,
 SqlEngine::SqlEngine(std::size_t cache_capacity) : cache_(cache_capacity) {}
 
 bool SqlEngine::execute(const std::string& sql, QueryResult& out, std::string& error) {
+    return execute(sql, out, error, nullptr, false);
+}
+
+bool SqlEngine::execute(const std::string& sql,
+                        QueryResult& out,
+                        std::string& error,
+                        std::string* cached_wire_out,
+                        bool binary_wire) {
     out = QueryResult{};
     error.clear();
+    if (cached_wire_out != nullptr) {
+        cached_wire_out->clear();
+    }
 
     // Fast path: avoid full string copy for INSERT batches
     // Just check first non-space char and strip trailing semicolon in-place
@@ -155,11 +302,19 @@ bool SqlEngine::execute(const std::string& sql, QueryResult& out, std::string& e
         return execute_create_table(normalized, error);
     }
     if (starts_with_keyword(upper, kInsertIntoKw)) {
-        std::unique_lock<std::shared_mutex> lock(db_mutex_);
         return execute_insert(normalized, error);
     }
     if (starts_with_keyword(upper, kSelectKw)) {
-        return execute_select(normalized, out, error);
+        return execute_select(normalized, out, error, cached_wire_out, binary_wire);
+    }
+
+    constexpr const char* kDeleteFromKw = "DELETE FROM";
+    {
+        std::string full_upper = to_upper(normalized);
+        if (starts_with_keyword(full_upper, kDeleteFromKw)) {
+            std::unique_lock<std::shared_mutex> lock(db_mutex_);
+            return execute_delete(normalized, error);
+        }
     }
 
     error = "unsupported SQL command";
@@ -175,15 +330,19 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
     }
 
     if (tables_.count(table_name) != 0U) {
+    return true; // IF NOT EXISTS — silent no-op
+}
+
+    auto [table_it, inserted] = tables_.try_emplace(table_name);
+    if (!inserted) {
         error = "table already exists: " + table_name;
         return false;
     }
-
-    Table t;
+    Table& t = table_it->second;
     t.name = table_name;
     t.columns = columns;
     t.primary_key_col = primary_col;
-    
+
     t.numeric_column_values.resize(t.columns.size());
     t.numeric_column_valid.resize(t.columns.size());
     if (primary_col >= 0) {
@@ -199,15 +358,11 @@ bool SqlEngine::execute_create_table(const std::string& sql, std::string& error)
         t.column_index[t.columns[i].name] = i;
         if (t.columns[i].type == DataType::kInt || t.columns[i].type == DataType::kDecimal ||
             t.columns[i].type == DataType::kDatetime) {
-            if (t.primary_key_col >= 0 && i == static_cast<std::size_t>(t.primary_key_col)) {
-                continue;
-            }
             t.numeric_column_values[i].reserve(1024);
             t.numeric_column_valid[i].reserve(1024);
         }
     }
 
-    tables_[t.name] = std::move(t);
     return true;
 }
 
@@ -219,6 +374,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
         return false;
     }
 
+    std::shared_lock<std::shared_mutex> map_lock(db_mutex_);
     auto it = tables_.find(table_name);
     if (it == tables_.end()) {
         error = "unknown table: " + table_name;
@@ -226,6 +382,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     }
 
     Table& table = it->second;
+    std::unique_lock<std::shared_mutex> table_lock(table.mutex);
     if (rows_values.empty()) {
         error = "INSERT must contain at least one VALUES tuple";
         return false;
@@ -238,10 +395,7 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
                 table.columns[i].type != DataType::kDatetime) {
                 continue;
             }
-            if (table.primary_key_col >= 0 && i == static_cast<std::size_t>(table.primary_key_col)) {
-                continue;
-            }
-           
+
             if (table.numeric_column_values[i].capacity() < target) {
                 table.numeric_column_values[i].reserve(target);
             }
@@ -348,6 +502,16 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
             }
         }
 
+        for (std::size_t i = 0; i < table.columns.size(); ++i) {
+            if (parsed_numeric_valid[i] == 0U) {
+                continue;
+            }
+            if (table.columns[i].type != DataType::kInt && table.columns[i].type != DataType::kDecimal) {
+                continue;
+            }
+            row.values[i].clear();
+        }
+
         table.rows.push_back(std::move(row));
         table.expiry_flat.push_back(table.rows.back().expires_at_unix);
         const std::size_t row_idx = table.rows.size() - 1;
@@ -366,9 +530,6 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
                 table.columns[i].type != DataType::kDatetime) {
                 continue;
             }
-            if (table.primary_key_col >= 0 && i == static_cast<std::size_t>(table.primary_key_col)) {
-                continue;
-            }
 
             table.numeric_column_values[i].push_back(parsed_numeric[i]);
             table.numeric_column_valid[i].push_back(parsed_numeric_valid[i]);
@@ -379,7 +540,11 @@ bool SqlEngine::execute_insert(const std::string& sql, std::string& error) {
     return true;
 }
 
-bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::string& error) {
+bool SqlEngine::execute_select(const std::string& sql,
+                               QueryResult& out,
+                               std::string& error,
+                               std::string* cached_wire_out,
+                               bool binary_wire) {
     SelectPlan plan;
     if (!parse_select(sql, plan, error)) {
         return false;
@@ -408,12 +573,14 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
     if (!skip_cache) {
         cache_key = normalize_sql_for_cache(sql);
         versions = capture_versions(plan.touched_tables);
-        if (cache_.get(cache_key, versions, out)) {
+        QueryResult* cache_out = &out;
+        if (cache_.get(cache_key, versions, cache_out, cached_wire_out, binary_wire)) {
             return true;
         }
     }
 
     if (!plan.has_join) {
+        std::shared_lock<std::shared_mutex> base_table_lock(base.mutex);
         std::vector<std::size_t> selected_indexes;
         if (plan.select_star) {
             for (std::size_t i = 0; i < base.columns.size(); ++i) {
@@ -493,18 +660,14 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         }
 
         const std::size_t proj_count = selected_indexes.size();
-        std::vector<std::string> projected_buf(proj_count);
 
         auto emit_projected_row = [&](std::size_t row_idx) {
-            const Row& row = base.rows[row_idx];
-            if (plan.select_star) {
-                out.rows.push_back(row.values);
-            } else {
-                for (std::size_t i = 0; i < proj_count; ++i) {
-                    projected_buf[i] = row.values[selected_indexes[i]];
-                }
-                out.rows.push_back(projected_buf);
+            std::vector<std::string> projected;
+            projected.reserve(proj_count);
+            for (std::size_t i = 0; i < proj_count; ++i) {
+                projected.push_back(cell_value_string(base, row_idx, selected_indexes[i]));
             }
+            out.rows.push_back(std::move(projected));
         };
 
         auto fast_numeric_value = [&](std::size_t row_idx, std::size_t col_idx, double& out_num) -> bool {
@@ -539,7 +702,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
 
             std::string cmp_error;
-            if (!compare_values(base.rows[row_idx].values[where_meta.idx],
+            if (!compare_values(cell_value_string(base, row_idx, where_meta.idx),
                                 where_meta.rhs_unquoted,
                                 where_meta.type,
                                 where_meta.op,
@@ -611,25 +774,38 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             if (col_vals.empty()) {
                 return true;
             }
-            // Safety: expiry_flat must match rows size, fall back if not
             out.rows.reserve(std::max<std::size_t>(1024, n / 2));
 
             const double rhs = where_meta.rhs_numeric;
             const char op0   = where_meta.op0;
             const char op1   = where_meta.op1;
             const std::int64_t* __restrict__ expiry_ptr = base.expiry_flat.data();
-            for (std::size_t i = 0; i < n; ++i) {
-                if (col_valid[i] == 0U) continue;
-                if (expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
-                const double lhs = col_vals[i];
-                bool pass;
-                if      (op0 == '=' && op1 == '\0') pass = (lhs == rhs);
-                else if (op0 == '!')                pass = (lhs != rhs);
-                else if (op0 == '>' && op1 == '\0') pass = (lhs >  rhs);
-                else if (op0 == '>' && op1 == '=')  pass = (lhs >= rhs);
-                else if (op0 == '<' && op1 == '\0') pass = (lhs <  rhs);
-                else                                pass = (lhs <= rhs);
-                if (!pass) continue;
+            std::vector<std::size_t> matching_indices;
+            matching_indices.reserve(n / 2);
+
+#pragma omp parallel
+{
+    std::vector<std::size_t> local_matches;
+    #pragma omp for nowait
+    for (std::size_t i = 0; i < n; ++i) {
+        if (col_valid[i] == 0U) continue;
+        if (expiry_ptr[i] != 0 && expiry_ptr[i] <= now_ts) continue;
+        const double lhs = col_vals[i];
+        bool pass;
+        if      (op0 == '=' && op1 == '\0') pass = (lhs == rhs);
+        else if (op0 == '!')                pass = (lhs != rhs);
+        else if (op0 == '>' && op1 == '\0') pass = (lhs >  rhs);
+        else if (op0 == '>' && op1 == '=')  pass = (lhs >= rhs);
+        else if (op0 == '<' && op1 == '\0') pass = (lhs <  rhs);
+        else                                pass = (lhs <= rhs);
+        if (pass) local_matches.push_back(i);
+    }
+    #pragma omp critical
+    matching_indices.insert(matching_indices.end(), local_matches.begin(), local_matches.end());
+}
+
+            std::sort(matching_indices.begin(), matching_indices.end());
+            for (std::size_t i : matching_indices) {
                 emit_projected_row(i);
             }
             return true;
@@ -657,6 +833,48 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             }
         }
 
+        if (plan.order_by.present) {
+            std::size_t sort_col_idx = 0;
+            bool found = false;
+            for (std::size_t i = 0; i < out.columns.size(); ++i) {
+                if (out.columns[i] == plan.order_by.column) {
+                    sort_col_idx = i;
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                error = "ORDER BY column not in SELECT list: " + plan.order_by.column;
+                return false;
+            }
+            DataType sort_type = DataType::kVarchar;
+            auto col_it = base.column_index.find(plan.order_by.column);
+            if (col_it != base.column_index.end()) {
+                sort_type = base.columns[col_it->second].type;
+            }
+            bool desc = plan.order_by.descending;
+            std::stable_sort(out.rows.begin(), out.rows.end(),
+                [&](const std::vector<std::string>& a, const std::vector<std::string>& b) {
+                    const std::string& av = a[sort_col_idx];
+                    const std::string& bv = b[sort_col_idx];
+                    bool less_than = false;
+                    if (sort_type == DataType::kInt) {
+                        std::int64_t ai = 0, bi = 0;
+                        fast_parse_int64(av, ai);
+                        fast_parse_int64(bv, bi);
+                        less_than = ai < bi;
+                    } else if (sort_type == DataType::kDecimal) {
+                        double ad = 0, bd = 0;
+                        fast_parse_double(av, ad);
+                        fast_parse_double(bv, bd);
+                        less_than = ad < bd;
+                    } else {
+                        less_than = av < bv;
+                    }
+                    return desc ? !less_than : less_than;
+                });
+        }
+
         if (!skip_cache) {
             cache_.put(cache_key, out, versions);
         }
@@ -669,6 +887,15 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
         return false;
     }
     const Table& right = join_it->second;
+    std::shared_lock<std::shared_mutex> table_lock_a;
+    std::shared_lock<std::shared_mutex> table_lock_b;
+    if (base.name <= right.name) {
+        table_lock_a = std::shared_lock<std::shared_mutex>(base.mutex);
+        table_lock_b = std::shared_lock<std::shared_mutex>(right.mutex);
+    } else {
+        table_lock_a = std::shared_lock<std::shared_mutex>(right.mutex);
+        table_lock_b = std::shared_lock<std::shared_mutex>(base.mutex);
+    }
 
     std::string left_join_tbl;
     std::string left_join_col;
@@ -996,9 +1223,9 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
             projected.reserve(projections.size());
             for (const Projection& p : projections) {
                 if (p.table == &base) {
-                    projected.push_back(base.rows[base_row_idx].values[p.index]);
+                    projected.push_back(cell_value_string(base, base_row_idx, p.index));
                 } else {
-                    projected.push_back(right.rows[right_row_idx].values[p.index]);
+                    projected.push_back(cell_value_string(right, right_row_idx, p.index));
                 }
             }
             out.rows.push_back(std::move(projected));
@@ -1006,7 +1233,7 @@ bool SqlEngine::execute_select(const std::string& sql, QueryResult& out, std::st
     }
 
     if (!skip_cache) {
-        cache_.put(cache_key, out, versions);
+        cache_.put(cache_key, out, versions, binary_wire);
     }
     return true;
 }
@@ -1016,7 +1243,6 @@ bool SqlEngine::parse_create_table(const std::string& sql,
                                    std::vector<Column>& columns,
                                    int& primary_col,
                                    std::string& error) const {
-    // Avoid trimming/copying — sql is already trimmed by execute()
     const std::string& s = sql;
     std::string upper = to_upper(s);
     if (!starts_with_keyword(upper, kCreateTableKw)) {
@@ -1031,7 +1257,14 @@ bool SqlEngine::parse_create_table(const std::string& sql,
         return false;
     }
 
-    std::string table_part = trim(s.substr(std::strlen(kCreateTableKw), open_paren - std::strlen(kCreateTableKw)));
+    std::string table_part_raw = trim(s.substr(std::strlen(kCreateTableKw), open_paren - std::strlen(kCreateTableKw)));
+    std::string table_part_upper = to_upper(table_part_raw);
+    std::string table_part;
+    if (table_part_upper.rfind("IF NOT EXISTS", 0) == 0) {
+        table_part = trim(table_part_raw.substr(std::strlen("IF NOT EXISTS")));
+    } else {
+        table_part = table_part_raw;
+    }
     if (!is_identifier(table_part)) {
         error = "invalid table name";
         return false;
@@ -1204,33 +1437,49 @@ bool SqlEngine::parse_insert(const std::string& sql,
                              std::vector<std::int64_t>& expires_at,
                              std::string& error) const {
     const std::string& s = sql;
-    // Only uppercase first 128 chars — INSERT INTO tablename VALUES always fits here
-    // This avoids copying the entire 40KB batch INSERT string for case conversion
-    const std::size_t header_scan = std::min<std::size_t>(s.size(), 128);
-    std::string upper = to_upper(s.substr(0, header_scan));
-    if (!starts_with_keyword(upper, kInsertIntoKw)) {
+    const char* p = s.c_str();
+    while (*p != '\0' && is_space_char(*p)) {
+        ++p;
+    }
+    if (!starts_with_ci(p, "INSERT")) {
         error = "expected INSERT INTO";
         return false;
     }
-
-    std::size_t values_kw = find_keyword(upper, "VALUES", 0);
-    if (values_kw == std::string::npos) {
-        upper = to_upper(s);
-        values_kw = find_keyword(upper, "VALUES", 0);
+    p += 6;
+    while (*p != '\0' && is_space_char(*p)) {
+        ++p;
     }
-    if (values_kw == std::string::npos) {
-        error = "INSERT must contain VALUES clause";
+    if (!starts_with_ci(p, "INTO")) {
+        error = "expected INSERT INTO";
         return false;
     }
+    p += 4;
+    while (*p != '\0' && is_space_char(*p)) {
+        ++p;
+    }
 
-    std::string table_part = trim(s.substr(std::strlen(kInsertIntoKw), values_kw - std::strlen(kInsertIntoKw)));
+    const char* tn = p;
+    while (*p != '\0' && (std::isalnum(static_cast<unsigned char>(*p)) != 0 || *p == '_')) {
+        ++p;
+    }
+    std::string table_part(tn, p);
     if (!is_identifier(table_part)) {
         error = "invalid table name in INSERT";
         return false;
     }
     table_name = to_lower(table_part);
 
-    std::size_t pos = values_kw + std::strlen("VALUES");
+    const char* values_kw = find_keyword_ci(p, "VALUES");
+    if (values_kw == nullptr) {
+        error = "INSERT must contain VALUES clause";
+        return false;
+    }
+    p = values_kw + 6;
+    while (*p != '\0' && is_space_char(*p)) {
+        ++p;
+    }
+
+    std::size_t pos = static_cast<std::size_t>(p - s.c_str());
     rows.clear();
     expires_at.clear();
 
@@ -1441,12 +1690,43 @@ bool SqlEngine::parse_select(const std::string& sql, SelectPlan& plan, std::stri
     std::string where_clause;
 
     if (join_pos == std::string::npos) {
+        std::size_t order_pos = find_keyword(from_upper, "ORDER BY", 0);
         std::string table_part;
-        if (where_pos == std::string::npos) {
+
+        std::size_t first_clause = std::string::npos;
+        if (where_pos != std::string::npos) first_clause = where_pos;
+        if (order_pos != std::string::npos && (first_clause == std::string::npos || order_pos < first_clause))
+            first_clause = order_pos;
+
+        if (first_clause == std::string::npos) {
             table_part = trim(from_remainder);
         } else {
-            table_part = trim(from_remainder.substr(0, where_pos));
-            where_clause = trim(from_remainder.substr(where_pos + std::strlen("WHERE")));
+            table_part = trim(from_remainder.substr(0, first_clause));
+            if (where_pos != std::string::npos && (order_pos == std::string::npos || where_pos < order_pos)) {
+                std::size_t where_end = where_pos + std::strlen("WHERE");
+                std::size_t where_clause_end = (order_pos != std::string::npos && order_pos > where_pos)
+                    ? order_pos : std::string::npos;
+                if (where_clause_end == std::string::npos)
+                    where_clause = trim(from_remainder.substr(where_end));
+                else
+                    where_clause = trim(from_remainder.substr(where_end, where_clause_end - where_end));
+            }
+            if (order_pos != std::string::npos) {
+                std::string order_str = trim(from_remainder.substr(order_pos + std::strlen("ORDER BY")));
+                std::string order_upper = to_upper(order_str);
+                bool desc = false;
+                if (order_upper.size() >= 5 &&
+                    order_upper.substr(order_upper.size() - 5) == " DESC") {
+                    order_str = trim(order_str.substr(0, order_str.size() - 5));
+                    desc = true;
+                } else if (order_upper.size() >= 4 &&
+                           order_upper.substr(order_upper.size() - 4) == " ASC") {
+                    order_str = trim(order_str.substr(0, order_str.size() - 4));
+                }
+                plan.order_by.column = to_lower(trim(order_str));
+                plan.order_by.descending = desc;
+                plan.order_by.present = true;
+            }
         }
 
         if (!is_identifier(table_part)) {
@@ -1503,6 +1783,20 @@ bool SqlEngine::parse_select(const std::string& sql, SelectPlan& plan, std::stri
             error = "invalid join condition";
             return false;
         }
+        std::string jl_tbl;
+        std::string jl_col;
+        std::string jr_tbl;
+        std::string jr_col;
+        if (!split_qualified(plan.join_left, jl_tbl, jl_col) ||
+            !split_qualified(plan.join_right, jr_tbl, jr_col) ||
+            jl_tbl.empty() || jl_col.empty() || jr_tbl.empty() || jr_col.empty() ||
+            !is_identifier(jl_tbl) || !is_identifier(jl_col) ||
+            !is_identifier(jr_tbl) || !is_identifier(jr_col)) {
+            error = "invalid join condition, expected table.column = table.column";
+            return false;
+        }
+        plan.join_left = to_lower(jl_tbl) + "." + to_lower(jl_col);
+        plan.join_right = to_lower(jr_tbl) + "." + to_lower(jr_col);
 
         plan.touched_tables = {plan.base_table, plan.join_table};
     }
@@ -1556,7 +1850,7 @@ bool SqlEngine::parse_select(const std::string& sql, SelectPlan& plan, std::stri
 }
 
 bool SqlEngine::evaluate_where(const Table& table,
-                               const Row& row,
+                               const Row& /*row*/,
                                std::size_t row_idx,
                                const Condition& condition,
                                std::string* error) const {
@@ -1603,7 +1897,7 @@ bool SqlEngine::evaluate_where(const Table& table,
     }
 
     std::string cmp_error;
-    if (!compare_values(row.values[idx], rhs, col->type, condition.op, result, cmp_error)) {
+    if (!compare_values(cell_value_string(table, row_idx, idx), rhs, col->type, condition.op, result, cmp_error)) {
         if (error != nullptr) {
             *error = cmp_error;
         }
@@ -1613,10 +1907,10 @@ bool SqlEngine::evaluate_where(const Table& table,
 }
 
 bool SqlEngine::evaluate_where_join(const Table& left,
-                                    const Row& left_row,
+                                    const Row& /*left_row*/,
                                     std::size_t left_row_idx,
                                     const Table& right,
-                                    const Row& right_row,
+                                    const Row& /*right_row*/,
                                     std::size_t right_row_idx,
                                     const Condition& condition,
                                     std::string* error) const {
@@ -1630,7 +1924,6 @@ bool SqlEngine::evaluate_where_join(const Table& left,
     std::string raw_col = cond_col.empty() ? condition.column : cond_col;
 
     const Table* table = nullptr;
-    const Row* row = nullptr;
     std::size_t row_idx = 0;
 
     if (cond_table.empty()) {
@@ -1653,20 +1946,16 @@ bool SqlEngine::evaluate_where_join(const Table& left,
         }
         if (in_left) {
             table = &left;
-            row = &left_row;
             row_idx = left_row_idx;
         } else {
             table = &right;
-            row = &right_row;
             row_idx = right_row_idx;
         }
     } else if (cond_table == left.name) {
         table = &left;
-        row = &left_row;
         row_idx = left_row_idx;
     } else if (cond_table == right.name) {
         table = &right;
-        row = &right_row;
         row_idx = right_row_idx;
     } else {
         if (error != nullptr) {
@@ -1702,7 +1991,12 @@ bool SqlEngine::evaluate_where_join(const Table& left,
     }
 
     std::string cmp_error;
-    if (!compare_values(row->values[idx], rhs, col->type, condition.op, result, cmp_error)) {
+    if (!compare_values(cell_value_string(*table, row_idx, idx),
+                        rhs,
+                        col->type,
+                        condition.op,
+                        result,
+                        cmp_error)) {
         if (error != nullptr) {
             *error = cmp_error;
         }
@@ -1719,6 +2013,7 @@ SqlEngine::capture_versions(const std::vector<std::string>& table_names) const {
     for (const std::string& t : table_names) {
         auto it = tables_.find(t);
         if (it != tables_.end()) {
+            std::shared_lock<std::shared_mutex> table_lock(it->second.mutex);
             out[t] = it->second.version;
         }
     }
@@ -2013,30 +2308,12 @@ bool SqlEngine::parse_numeric_literal(const std::string& s, DataType type, doubl
 }
 
 bool SqlEngine::eval_numeric_op(double lhs, double rhs, const std::string& op, bool& out) {
-    if (op == "=") {
-        out = (lhs == rhs);
-        return true;
-    }
-    if (op == "!=") {
-        out = (lhs != rhs);
-        return true;
-    }
-    if (op == "<") {
-        out = (lhs < rhs);
-        return true;
-    }
-    if (op == "<=") {
-        out = (lhs <= rhs);
-        return true;
-    }
-    if (op == ">") {
-        out = (lhs > rhs);
-        return true;
-    }
-    if (op == ">=") {
-        out = (lhs >= rhs);
-        return true;
-    }
+    if (op == "=") { out = (lhs == rhs); return true; }
+    if (op == "!=") { out = (lhs != rhs); return true; }
+    if (op == "<") { out = (lhs < rhs); return true; }
+    if (op == "<=") { out = (lhs <= rhs); return true; }
+    if (op == ">") { out = (lhs > rhs); return true; }
+    if (op == ">=") { out = (lhs >= rhs); return true; }
     return false;
 }
 
@@ -2049,67 +2326,46 @@ bool SqlEngine::compare_values(const std::string& lhs,
     const bool lhs_is_null = is_null_literal_ci(lhs);
     const bool rhs_is_null = is_null_literal_ci(rhs);
     if (lhs_is_null || rhs_is_null) {
-        if (op == "=") {
-            out = lhs_is_null && rhs_is_null;
-            return true;
-        }
-        if (op == "!=") {
-            out = lhs_is_null != rhs_is_null;
-            return true;
-        }
+        if (op == "=") { out = lhs_is_null && rhs_is_null; return true; }
+        if (op == "!=") { out = lhs_is_null != rhs_is_null; return true; }
         out = false;
         return true;
     }
 
     auto apply_op = [&](auto a, auto b) {
-        if (op == "=") {
-            out = (a == b);
-        } else if (op == "!=") {
-            out = (a != b);
-        } else if (op == "<") {
-            out = (a < b);
-        } else if (op == "<=") {
-            out = (a <= b);
-        } else if (op == ">") {
-            out = (a > b);
-        } else if (op == ">=") {
-            out = (a >= b);
-        } else {
-            error = "unsupported operator in WHERE: " + op;
-            return false;
-        }
+        if (op == "=") { out = (a == b); }
+        else if (op == "!=") { out = (a != b); }
+        else if (op == "<") { out = (a < b); }
+        else if (op == "<=") { out = (a <= b); }
+        else if (op == ">") { out = (a > b); }
+        else if (op == ">=") { out = (a >= b); }
+        else { error = "unsupported operator in WHERE: " + op; return false; }
         return true;
     };
 
     if (type == DataType::kInt) {
-        std::int64_t a = 0;
-        std::int64_t b = 0;
+        std::int64_t a = 0, b = 0;
         if (!fast_parse_int64(lhs, a) || !fast_parse_int64(rhs, b)) {
             error = "invalid integer comparison value";
             return false;
         }
         return apply_op(a, b);
     }
-
     if (type == DataType::kDecimal) {
-        double a = 0.0;
-        double b = 0.0;
+        double a = 0.0, b = 0.0;
         if (!fast_parse_double(lhs, a) || !fast_parse_double(rhs, b)) {
             error = "invalid decimal comparison value";
             return false;
         }
         return apply_op(a, b);
     }
-
     if (type == DataType::kDatetime) {
-        std::int64_t a = 0;
-        std::int64_t b = 0;
+        std::int64_t a = 0, b = 0;
         if (!parse_datetime_to_unix(lhs, a) || !parse_datetime_to_unix(rhs, b)) {
             return apply_op(lhs, rhs);
         }
         return apply_op(a, b);
     }
-
     return apply_op(lhs, rhs);
 }
 
@@ -2127,41 +2383,16 @@ bool SqlEngine::parse_condition(const std::string& text, Condition& out, std::st
 
     for (std::size_t i = 0; i < s.size(); ++i) {
         char c = s[i];
-        if (c == '\'' && !in_double) {
-            in_single = !in_single;
-            continue;
-        }
-        if (c == '"' && !in_single) {
-            in_double = !in_double;
-            continue;
-        }
-        if (in_single || in_double) {
-            continue;
-        }
+        if (c == '\'' && !in_double) { in_single = !in_single; continue; }
+        if (c == '"' && !in_single) { in_double = !in_double; continue; }
+        if (in_single || in_double) continue;
 
         if (i + 1 < s.size()) {
-            if (s[i] == '!' && s[i + 1] == '=') {
-                op_pos = i;
-                op = "!=";
-                break;
-            }
-            if (s[i] == '<' && s[i + 1] == '=') {
-                op_pos = i;
-                op = "<=";
-                break;
-            }
-            if (s[i] == '>' && s[i + 1] == '=') {
-                op_pos = i;
-                op = ">=";
-                break;
-            }
+            if (s[i] == '!' && s[i+1] == '=') { op_pos = i; op = "!="; break; }
+            if (s[i] == '<' && s[i+1] == '=') { op_pos = i; op = "<="; break; }
+            if (s[i] == '>' && s[i+1] == '=') { op_pos = i; op = ">="; break; }
         }
-
-        if (c == '=' || c == '<' || c == '>') {
-            op_pos = i;
-            op.assign(1, c);
-            break;
-        }
+        if (c == '=' || c == '<' || c == '>') { op_pos = i; op.assign(1, c); break; }
     }
 
     if (op_pos == std::string::npos) {
@@ -2176,8 +2407,7 @@ bool SqlEngine::parse_condition(const std::string& text, Condition& out, std::st
         return false;
     }
 
-    std::string tbl;
-    std::string col;
+    std::string tbl, col;
     if (!split_qualified(lhs, tbl, col)) {
         error = "invalid WHERE clause; expected a valid column reference";
         return false;
@@ -2205,23 +2435,17 @@ bool SqlEngine::split_qualified(const std::string& qualified,
         column = qualified;
         return true;
     }
-
     if (qualified.find('.', dot + 1) != std::string::npos) {
         return false;
     }
-
     table = trim(qualified.substr(0, dot));
     column = trim(qualified.substr(dot + 1));
     return !table.empty() && !column.empty();
 }
 
 bool SqlEngine::starts_with_keyword(const std::string& sql_upper, const std::string& kw) {
-    if (sql_upper.rfind(kw, 0) != 0) {
-        return false;
-    }
-    if (sql_upper.size() == kw.size()) {
-        return true;
-    }
+    if (sql_upper.rfind(kw, 0) != 0) return false;
+    if (sql_upper.size() == kw.size()) return true;
     return std::isspace(static_cast<unsigned char>(sql_upper[kw.size()])) != 0;
 }
 
@@ -2233,31 +2457,17 @@ std::size_t SqlEngine::find_keyword(const std::string& sql_upper,
 
     for (std::size_t i = start; i + kw.size() <= sql_upper.size(); ++i) {
         char c = sql_upper[i];
-        if (c == '\'' && !in_double) {
-            in_single = !in_single;
-            continue;
-        }
-        if (c == '"' && !in_single) {
-            in_double = !in_double;
-            continue;
-        }
-        if (in_single || in_double) {
-            continue;
-        }
-        if (sql_upper.compare(i, kw.size(), kw) != 0) {
-            continue;
-        }
+        if (c == '\'' && !in_double) { in_single = !in_single; continue; }
+        if (c == '"' && !in_single) { in_double = !in_double; continue; }
+        if (in_single || in_double) continue;
+        if (sql_upper.compare(i, kw.size(), kw) != 0) continue;
 
-        bool left_ok = (i == 0) || std::isspace(static_cast<unsigned char>(sql_upper[i - 1])) ||
-                       sql_upper[i - 1] == ')';
+        bool left_ok = (i == 0) || std::isspace(static_cast<unsigned char>(sql_upper[i-1])) || sql_upper[i-1] == ')';
         bool right_ok = (i + kw.size() == sql_upper.size()) ||
                         std::isspace(static_cast<unsigned char>(sql_upper[i + kw.size()])) ||
                         sql_upper[i + kw.size()] == '(';
-        if (left_ok && right_ok) {
-            return i;
-        }
+        if (left_ok && right_ok) return i;
     }
-
     return std::string::npos;
 }
 
@@ -2277,9 +2487,34 @@ bool SqlEngine::row_numeric_value(const Table& table,
     if (row_idx >= valid.size() || row_idx >= values.size() || valid[row_idx] == 0U) {
         return false;
     }
-
     out = values[row_idx];
     return true;
+}
+
+std::string SqlEngine::cell_value_string(const Table& table,
+                                         std::size_t row_idx,
+                                         std::size_t col_idx) const {
+    if (row_idx >= table.rows.size() || col_idx >= table.columns.size()) return {};
+    const Row& row = table.rows[row_idx];
+    if (col_idx >= row.values.size()) return {};
+
+    const std::string& raw = row.values[col_idx];
+    if (!raw.empty()) return raw;
+
+    const Column& col = table.columns[col_idx];
+    if (col.type != DataType::kInt && col.type != DataType::kDecimal) return raw;
+
+    double numeric = 0.0;
+    if (!row_numeric_value(table, row_idx, col_idx, numeric)) return raw;
+
+    if (col.type == DataType::kInt) {
+        return std::to_string(static_cast<long long>(numeric));
+    }
+
+    char buf[64];
+    auto conv = std::to_chars(buf, buf + sizeof(buf), numeric, std::chars_format::general);
+    if (conv.ec == std::errc{}) return std::string(buf, conv.ptr);
+    return std::to_string(numeric);
 }
 
 bool SqlEngine::validate_typed_value(const Column& col,
@@ -2287,9 +2522,7 @@ bool SqlEngine::validate_typed_value(const Column& col,
                                      std::string& error,
                                      double* numeric_out,
                                      bool* numeric_valid) const {
-    if (numeric_valid != nullptr) {
-        *numeric_valid = false;
-    }
+    if (numeric_valid != nullptr) *numeric_valid = false;
     trim_in_place(value);
     if (is_null_literal_ci(value)) {
         if (col.not_null || col.primary_key) {
@@ -2305,50 +2538,34 @@ bool SqlEngine::validate_typed_value(const Column& col,
             error = "invalid INT value for column " + col.name;
             return false;
         }
-        if (numeric_out != nullptr) {
-            *numeric_out = static_cast<double>(parsed);
-        }
-        if (numeric_valid != nullptr) {
-            *numeric_valid = true;
-        }
+        if (numeric_out) *numeric_out = static_cast<double>(parsed);
+        if (numeric_valid) *numeric_valid = true;
         return true;
     }
-
     if (col.type == DataType::kDecimal) {
         double parsed = 0.0;
         if (!fast_parse_double(value, parsed)) {
             error = "invalid DECIMAL value for column " + col.name;
             return false;
         }
-        if (numeric_out != nullptr) {
-            *numeric_out = parsed;
-        }
-        if (numeric_valid != nullptr) {
-            *numeric_valid = true;
-        }
+        if (numeric_out) *numeric_out = parsed;
+        if (numeric_valid) *numeric_valid = true;
         return true;
     }
-
     if (col.type == DataType::kDatetime) {
         std::int64_t parsed = 0;
         if (!parse_datetime_to_unix(value, parsed)) {
             error = "invalid DATETIME for column " + col.name + " (use YYYY-MM-DD HH:MM:SS)";
             return false;
         }
-        if (numeric_out != nullptr) {
-            *numeric_out = static_cast<double>(parsed);
-        }
-        if (numeric_valid != nullptr) {
-            *numeric_valid = true;
-        }
+        if (numeric_out) *numeric_out = static_cast<double>(parsed);
+        if (numeric_valid) *numeric_valid = true;
         return true;
     }
-
     if (col.varchar_limit > 0 && static_cast<int>(value.size()) > col.varchar_limit) {
         error = "VARCHAR length exceeded for column " + col.name;
         return false;
     }
-
     return true;
 }
 
@@ -2356,7 +2573,6 @@ const SqlEngine::Column* SqlEngine::lookup_column(const Table& table,
                                                    const std::string& col_ref,
                                                    std::size_t& idx,
                                                    std::string& error) const {
-    // Fast path: check if already lowercase (common case)
     auto it = table.column_index.find(col_ref);
     if (it == table.column_index.end()) {
         std::string key = to_lower(col_ref);
@@ -2368,6 +2584,34 @@ const SqlEngine::Column* SqlEngine::lookup_column(const Table& table,
     }
     idx = it->second;
     return &table.columns[idx];
+}
+
+bool SqlEngine::execute_delete(const std::string& sql, std::string& error) {
+    std::string upper = to_upper(sql);
+    const std::string kw = "DELETE FROM";
+    if (!starts_with_keyword(upper, kw)) {
+        error = "expected DELETE FROM";
+        return false;
+    }
+    std::string table_name = to_lower(trim(sql.substr(kw.size())));
+    if (!table_name.empty() && table_name.back() == ';') {
+        table_name.pop_back();
+        table_name = trim(table_name);
+    }
+    auto it = tables_.find(table_name);
+    if (it == tables_.end()) {
+        error = "unknown table: " + table_name;
+        return false;
+    }
+    Table& table = it->second;
+    table.rows.clear();
+    table.expiry_flat.clear();
+    table.primary_index.clear();
+    table.pk_robin_index = RobinHoodIndex(1024);
+    for (auto& vec : table.numeric_column_values) vec.clear();
+    for (auto& vec : table.numeric_column_valid) vec.clear();
+    ++table.version;
+    return true;
 }
 
 }  // namespace flexql

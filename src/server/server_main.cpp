@@ -11,6 +11,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cerrno>
+#include <cstdint>
 #include <condition_variable>
 #include <functional>
 #include <iostream>
@@ -69,38 +70,45 @@ bool send_error(int fd, const std::string& message) {
     return flexql_proto::send_all(fd, line.data(), line.size());
 }
 
-bool send_result(int fd, const QueryResult& result) {
-    constexpr std::size_t kChunkFlush = 256 * 1024;
-    std::string chunk;
-    chunk.reserve(kChunkFlush + 4096);
+inline void append_u16_be(std::string& out, std::uint16_t v) {
+    const std::uint16_t be = htons(v);
+    out.append(reinterpret_cast<const char*>(&be), sizeof(be));
+}
 
-    auto flush = [&]() -> bool {
-        if (chunk.empty()) {
-            return true;
-        }
-        bool ok = flexql_proto::send_all(fd, chunk.data(), chunk.size());
-        chunk.clear();
-        return ok;
-    };
+inline void append_u32_be(std::string& out, std::uint32_t v) {
+    const std::uint32_t be = htonl(v);
+    out.append(reinterpret_cast<const char*>(&be), sizeof(be));
+}
 
-    chunk += "OK " + std::to_string(result.columns.size()) + "\n";
-    if (result.columns.empty()) {
-        chunk += "END\n";
-        return flush();
+bool send_error_binary(int fd, const std::string& message) {
+    std::string wire;
+    wire.reserve(1 + 4 + message.size());
+    wire.push_back(static_cast<char>(0x02));  // ERROR frame
+    append_u32_be(wire, static_cast<std::uint32_t>(message.size()));
+    wire.append(message);
+    return flexql_proto::send_all(fd, wire.data(), wire.size());
+}
+
+bool send_result_binary(int fd, const QueryResult& result) {
+    std::string wire;
+    wire.reserve(1 + 4 + 4 + result.columns.size() * 8 + result.rows.size() * 16);
+    wire.push_back(static_cast<char>(0x01));  // OK frame
+    append_u32_be(wire, static_cast<std::uint32_t>(result.columns.size()));
+    append_u32_be(wire, static_cast<std::uint32_t>(result.rows.size()));
+
+    for (const std::string& c : result.columns) {
+        const std::size_t n = std::min<std::size_t>(c.size(), 0xFFFF);
+        append_u16_be(wire, static_cast<std::uint16_t>(n));
+        wire.append(c.data(), n);
     }
-
-    append_line_with_fields(chunk, "COL", result.columns);
     for (const auto& row : result.rows) {
-        append_line_with_fields(chunk, "ROW", row);
-        if (chunk.size() >= kChunkFlush) {
-            if (!flush()) {
-                return false;
-            }
+        for (const std::string& v : row) {
+            append_u32_be(wire, static_cast<std::uint32_t>(v.size()));
+            wire.append(v);
         }
     }
 
-    chunk += "END\n";
-    return flush();
+    return flexql_proto::send_all(fd, wire.data(), wire.size());
 }
 
 void handle_client(int client_fd, SqlEngine* engine) {
@@ -114,7 +122,14 @@ void handle_client(int client_fd, SqlEngine* engine) {
             continue;
         }
 
-        if (header.rfind("Q ", 0) != 0) {
+        bool want_binary = false;
+        const char* num_start = nullptr;
+        if (header.rfind("Q ", 0) == 0) {
+            num_start = header.c_str() + 2;
+        } else if (header.rfind("QB ", 0) == 0) {
+            want_binary = true;
+            num_start = header.c_str() + 3;
+        } else {
             if (!send_error(client_fd, "protocol error: expected query header")) {
                 break;
             }
@@ -123,12 +138,14 @@ void handle_client(int client_fd, SqlEngine* engine) {
 
         std::size_t len = 0;
         {
-            const char* num_start = header.c_str() + 2;
             char* num_end = nullptr;
             errno = 0;
             unsigned long long parsed = std::strtoull(num_start, &num_end, 10);
             if (errno != 0 || num_end == num_start || *num_end != '\0') {
-                if (!send_error(client_fd, "protocol error: invalid query length")) {
+                const bool ok = want_binary
+                                    ? send_error_binary(client_fd, "protocol error: invalid query length")
+                                    : send_error(client_fd, "protocol error: invalid query length");
+                if (!ok) {
                     break;
                 }
                 continue;
@@ -136,7 +153,10 @@ void handle_client(int client_fd, SqlEngine* engine) {
             len = static_cast<std::size_t>(parsed);
         }
         if (len > (1ULL << 31)) {
-            if (!send_error(client_fd, "protocol error: invalid query length")) {
+            const bool ok = want_binary
+                                ? send_error_binary(client_fd, "protocol error: invalid query length")
+                                : send_error(client_fd, "protocol error: invalid query length");
+            if (!ok) {
                 break;
             }
             continue;
@@ -148,9 +168,23 @@ void handle_client(int client_fd, SqlEngine* engine) {
         }
 
         QueryResult result;
+        std::string cached_wire;
         std::string error;
-        if (!engine->execute(sql, result, error)) {
-            if (!send_error(client_fd, error)) {
+        if (!engine->execute(sql, result, error, &cached_wire, want_binary)) {
+            const bool ok = want_binary ? send_error_binary(client_fd, error) : send_error(client_fd, error);
+            if (!ok) {
+                break;
+            }
+            continue;
+        }
+        if (!cached_wire.empty()) {
+            if (!flexql_proto::send_all(client_fd, cached_wire.data(), cached_wire.size())) {
+                break;
+            }
+            continue;
+        }
+        if (want_binary) {
+            if (!send_result_binary(client_fd, result)) {
                 break;
             }
             continue;
@@ -282,6 +316,8 @@ int main(int argc, char** argv) {
         ::close(server_fd);
         return 1;
     }
+    int one2 = 1;
+    (void)::setsockopt(server_fd, SOL_SOCKET, SO_REUSEPORT, &one2, sizeof(one2));
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
@@ -319,9 +355,9 @@ int main(int argc, char** argv) {
 
         int one_tcp = 1;
         (void)::setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &one_tcp, sizeof(one_tcp));
-        int rcvbuf = 1 << 20;
+        int rcvbuf = 4 << 20;
         (void)::setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
-        int sndbuf = 1 << 20;
+        int sndbuf = 4 << 20;
         (void)::setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
         pool.submit([client_fd, &engine]() {
             handle_client(client_fd, &engine);

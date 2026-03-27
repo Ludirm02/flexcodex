@@ -19,7 +19,7 @@ std::string unescape_field(const std::string& in);
 std::string join_tab_escaped(const std::vector<std::string>& fields, std::size_t start_index = 0);
 std::vector<std::string> split_tab_escaped(const std::string& line, std::size_t start_index = 0);
 
-bool send_query(int fd, const std::string& sql);
+bool send_query(int fd, const std::string& sql, bool want_binary = false);
 
 }  // namespace flexql_proto
 
